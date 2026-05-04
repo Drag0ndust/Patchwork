@@ -36,6 +36,41 @@ Installing a Skill or Agent Definition into a project creates a **symlink** from
 
 The macOS app and the CLI share the same core library (`PatchworkCore`) written in Swift. Patchwork stores its own data — project registry, config, tool overrides — in `~/.patchwork/`, accessible to both.
 
+## Roadmap
+
+### v1.0 — CLI foundation
+- [ ] `patchwork add <path>` — add a Skill to the Library
+- [ ] `patchwork install <name>` — symlink a Skill into the current project (Claude Code preset)
+- [ ] `patchwork uninstall <name>` — remove a symlink from the current project
+- [ ] `patchwork list` — show all Skills in the Library
+- [ ] `patchwork status` — show Skills installed in the current project
+- [ ] `patchwork help` — show usage
+- [ ] Library Root defaults to `~/.claude/`, overridable via `PATCHWORK_LIBRARY_ROOT`
+- [ ] GitHub Releases distribution (macOS arm64/x86\_64, Linux)
+
+### v1.1 — Agent Definitions
+- [ ] Agent Definition support (`AGENT.md`, `SOUL.md`, `SKILLS`)
+- [ ] `SKILLS` dependency resolution on install
+
+### v1.x — Ecosystem
+- [ ] More Tool Presets (Codex, custom tools)
+- [ ] Project registration
+- [ ] Shell completions
+- [ ] `patchwork init` — bootstrap a project with a predefined set of Skills
+- [ ] Windows support (symlinks via Developer Mode, hard fail otherwise)
+
+### v2.0 — macOS app
+- [ ] macOS app (SwiftUI)
+- [ ] Homebrew tap
+- [ ] iCloud sync for Library Root
+- [ ] Remote community registry
+- [ ] Team/org shared Library
+
+### v3.0 — Remote ecosystem
+- [ ] Import Skills from hosted Library
+- [ ] `patchwork update` — pull latest remote Skills into the Library
+- [ ] Skill version pinning
+
 ## Status
 
 Early development. The domain model and architecture are defined — see [`CONTEXT.md`](./CONTEXT.md) and [`docs/adr/`](./docs/adr/) for decisions made so far.
