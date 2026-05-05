@@ -19,22 +19,21 @@ jobs:
         include:
           - os: macOS
             arch: arm64
-            runner: macos-14
+            runner: macos-15
+            install-swift: false
           - os: macOS
             arch: x86_64
             runner: macos-13
+            install-swift: true
           - os: Linux
             arch: x86_64
             runner: ubuntu-latest
+            install-swift: true
     steps:
       - uses: actions/checkout@v4
 
-      - name: Select Xcode (macOS)
-        if: runner.os == 'macOS'
-        run: sudo xcode-select -s /Applications/Xcode.app
-
-      - name: Install Swift 6 toolchain (Linux)
-        if: runner.os == 'Linux'
+      - name: Install Swift 6 toolchain
+        if: matrix.install-swift
         uses: SwiftyLab/setup-swift@latest
         with:
           swift-version: "6.0"
