@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macOS
+            arch: arm64
+            runner: macos-14
+          - os: macOS
+            arch: x86_64
+            runner: macos-13
+          - os: Linux
+            arch: x86_64
+            runner: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode (macOS)
+        if: runner.os == 'macOS'
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Install Swift 6 toolchain (Linux)
+        if: runner.os == 'Linux'
+        uses: SwiftyLab/setup-swift@latest
+        with:
+          swift-version: "6.0"
+
+      - name: Print Swift version
+        run: swift --version
+
+      - name: Build
+        run: swift build -c debug
+
+      - name: Test
+        run: swift test
