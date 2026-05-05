@@ -32,7 +32,7 @@ public struct LibraryRoot: Sendable, Equatable {
         fileManager: FileManager = .default
     ) throws -> LibraryRoot {
         if let raw = environment[environmentVariableName], !raw.isEmpty {
-            let expanded = (raw as NSString).expandingTildeInPath
+            let expanded = expandTilde(raw, home: homeDirectory)
             guard expanded.hasPrefix("/") else {
                 throw ResolutionError.envVarRelative(rawValue: raw)
             }
@@ -48,6 +48,16 @@ public struct LibraryRoot: Sendable, Equatable {
 
         let defaultURL = homeDirectory.appendingPathComponent(".claude", isDirectory: true)
         return LibraryRoot(url: defaultURL)
+    }
+
+    private static func expandTilde(_ path: String, home: URL) -> String {
+        if path == "~" {
+            return home.path
+        }
+        if path.hasPrefix("~/") {
+            return home.path + String(path.dropFirst(1))
+        }
+        return path
     }
 
     public var skillsDirectory: URL {
