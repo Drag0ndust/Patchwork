@@ -123,14 +123,27 @@ final class LibraryRootTests: XCTestCase {
         XCTAssertEqual(resolved.url.path, fakeHome.appendingPathComponent(".claude").path)
     }
 
-    func testEnvWithTildeIsExpandedAndAccepted() throws {
-        // Using the real home so tilde expansion has somewhere to go.
-        let realHome = FileManager.default.homeDirectoryForCurrentUser
+    func testEnvWithTildeIsExpandedAgainstInjectedHome() throws {
+        let fakeHome = tempRoot.appendingPathComponent("fake-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: fakeHome, withIntermediateDirectories: true)
+
         let resolved = try LibraryRoot.resolve(
             environment: ["PATCHWORK_LIBRARY_ROOT": "~"],
-            homeDirectory: tempRoot
+            homeDirectory: fakeHome
         )
-        XCTAssertEqual(resolved.url.path, realHome.path)
+        XCTAssertEqual(resolved.url.path, fakeHome.path)
+    }
+
+    func testEnvWithTildeSlashSubpathIsExpandedAgainstInjectedHome() throws {
+        let fakeHome = tempRoot.appendingPathComponent("fake-home", isDirectory: true)
+        let inside = fakeHome.appendingPathComponent("library", isDirectory: true)
+        try FileManager.default.createDirectory(at: inside, withIntermediateDirectories: true)
+
+        let resolved = try LibraryRoot.resolve(
+            environment: ["PATCHWORK_LIBRARY_ROOT": "~/library"],
+            homeDirectory: fakeHome
+        )
+        XCTAssertEqual(resolved.url.path, inside.path)
     }
 
     func testSkillsDirectoryIsRootSlashSkills() throws {

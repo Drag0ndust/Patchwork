@@ -9,6 +9,9 @@ struct Help: ParsableCommand {
     @Argument(help: "the command to show help for")
     var subcommand: String?
 
+    // The cases below mirror Patchwork.configuration.subcommands. When you add
+    // a new subcommand, add a case here too — the compiler will not catch the
+    // omission.
     func run() throws {
         guard let name = subcommand else {
             print(Patchwork.helpMessage())
