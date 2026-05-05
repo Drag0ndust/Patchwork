@@ -21,10 +21,6 @@ jobs:
             arch: arm64
             runner: macos-15
             install-swift: false
-          - os: macOS
-            arch: x86_64
-            runner: macos-13
-            install-swift: true
           - os: Linux
             arch: x86_64
             runner: ubuntu-latest
