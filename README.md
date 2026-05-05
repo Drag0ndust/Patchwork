@@ -10,7 +10,7 @@ Patchwork gives you a single source of truth — your Library — and makes depl
 
 ## Core concepts
 
-**Skill** — a markdown prompt file that tells an AI agent how to perform a specific task (e.g. `/diagnose`, `/tdd`). You write it once in your Library and install it into as many projects as you like.
+**Skill** — a directory that tells an AI agent how to perform a specific task (e.g. `/diagnose`, `/tdd`). It contains a `SKILL.md` prompt and any supporting files (scripts, examples, sub-docs). You write it once in your Library and install it into as many projects as you like.
 
 **Agent Definition** — a directory that defines a complete agent persona:
 - `AGENT.md` — what the agent does and how it behaves (required)
@@ -29,12 +29,14 @@ Installing a Skill or Agent Definition into a project creates a **symlink** from
 
 ## Platforms
 
-| Component | Platform |
-|---|---|
-| GUI app | macOS (SwiftUI, iCloud-ready) |
-| CLI | macOS, Linux, Windows |
+| Component | Platform | When |
+|---|---|---|
+| CLI | macOS arm64, macOS x86_64, Linux x86_64 | v1.0 |
+| CLI | + Windows | v1.x |
+| GUI app | macOS (SwiftUI, iCloud-ready) | v2.0 |
+| Homebrew tap | macOS, Linux | v2.0 |
 
-The macOS app and the CLI share the same core library (`PatchworkCore`) written in Swift. Patchwork stores its own data — project registry, config, tool overrides — in `~/.patchwork/`, accessible to both.
+The macOS app and the CLI share the same core library (`PatchworkCore`) written in Swift. From v1.x onwards, Patchwork stores its own data — project registry, config, tool overrides — in `~/.patchwork/`, accessible to both. v1.0 ships without persistent state: the only durable artifacts are the Library directory and the symlinks `install` writes into Projects.
 
 ## Roadmap
 

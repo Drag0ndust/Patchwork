@@ -10,7 +10,7 @@
 ## Glossary
 
 ### Skill
-A prompt file that instructs an AI agent how to perform a specific, named task (e.g. `/diagnose`, `/tdd`). Skills live in `~/.claude/skills/` and are invoked by name inside a project.
+A directory in the Library that instructs an AI agent how to perform a specific, named task (e.g. `/diagnose`, `/tdd`). The directory's name **is** the Skill's name. It must contain a `SKILL.md` (the prompt body, with frontmatter) and may contain any supporting files the Skill references — sub-docs, scripts, examples. Skills live in `~/.claude/skills/` and are invoked by name inside a project.
 
 ### Agent Definition
 A directory in the Library that defines a complete agent persona. Contains:
@@ -34,6 +34,8 @@ The act of creating a symlink from a Skill or Agent Definition in the Library in
 
 ### Project
 A directory on disk explicitly registered with Patchwork. A Project can be associated with one or more Tools. Patchwork tracks which Skills and Agent Definitions are installed per Tool within a Project. When installing, the user can target one specific Tool or all configured Tools at once.
+
+> **v1.0 note:** explicit Project registration ships in v1.x. In v1.0, `install` / `uninstall` / `status` operate on the current working directory implicitly, with the Tool fixed to the Claude Code preset. The filesystem (symlinks under `./.claude/skills/`) is the source of truth — there is no `~/.patchwork/` registry yet. The registry is introduced additively in v1.x without breaking v1.0 installs.
 
 ### Tool
 An AI coding assistant that consumes Skills or Agent Definitions (e.g. Claude Code, Codex). Patchwork ships with built-in presets for known Tools and allows users to define custom Tool configurations or override presets.
