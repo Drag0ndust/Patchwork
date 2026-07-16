@@ -1,7 +1,7 @@
 name: "🚀 Feature request"
 title: FEATURE -
-description: Suggest a feature that will improve the Patchwork
-labels: ["feature request"]
+description: Suggest a feature that will improve Patchwork
+labels: ["needs-triage", "enhancement"]
 body:
   - type: markdown
     attributes:

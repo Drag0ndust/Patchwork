@@ -1,7 +1,7 @@
 name: "\U0001F41E Bug report"
 title: BUG -
 description: Create a report to help us improve Patchwork
-labels: ["bug"]
+labels: ["needs-triage", "bug"]
 body:
   - type: markdown
     attributes:
