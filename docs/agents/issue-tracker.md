@@ -23,12 +23,13 @@ Run `gh issue view <number> --comments`.
 
 ## Wayfinding operations
 
-For the `coding:wayfinder` skill. GitHub's `gh` CLI has no first-class issue-dependency or claim primitive, so express these with labels and a body convention.
+For the `coding:wayfinder` skill. GitHub has **native sub-issues** (parent/child) and **native issue dependencies** (blocked-by) — use these, **not** labels or body conventions, for map membership and blocking. Both are driven through `gh api`; the `sub_issue_id` / `issue_id` params take the issue's **database id** (`gh api repos/{owner}/{repo}/issues/<n> --jq .id`), not its number.
 
 - **Create the map**: `gh issue create --title "..." --label wayfinder:map`. Note its number `<M>`.
-- **Create a ticket** (child of map `<M>`): `gh issue create --label "wayfinder:map-<M>,wayfinder:<type>"`, where `<type>` is `research`, `prototype`, `grilling`, or `task`. The `wayfinder:map-<M>` label is what makes it a child and drives the frontier query. Reference the map in the body so a reader can navigate up.
-- **Blocking** (no native relationship): record it in the ticket body under a `## Blocked by` section listing the blockers as `- #<n>` task-list items. A ticket is unblocked when every issue it lists is closed.
-- **Frontier query** (open, unblocked, unclaimed children): `gh issue list --label "wayfinder:map-<M>" --state open --json number,title,assignees,body`, then drop any ticket that has an assignee or whose `## Blocked by` refs are not all closed.
+- **Create a ticket**: `gh issue create --label "wayfinder:<type>"`, where `<type>` is `research`, `prototype`, `grilling`, or `task`. Then attach it as a **sub-issue** of the map (below). Reference the map in the body so a reader can navigate up.
+- **Attach as sub-issue** (child of map `<M>`): `gh api --method POST repos/{owner}/{repo}/issues/<M>/sub_issues -F sub_issue_id=<child-db-id>`. This native parent/child link is what makes it a map ticket and renders the tree in GitHub's UI.
+- **Blocking** (native): `gh api --method POST repos/{owner}/{repo}/issues/<n>/dependencies/blocked_by -F issue_id=<blocker-db-id>`. Remove with the matching `DELETE .../dependencies/blocked_by/<blocker-db-id>`. A ticket's live block count is `.issue_dependencies_summary.blocked_by` (open blockers only); `total_blocked_by` counts closed ones too.
+- **Frontier query** (open, unblocked, unclaimed children): `gh api repos/{owner}/{repo}/issues/<M>/sub_issues --jq '.[] | select(.state=="open") | {number,title,assignee:.assignee.login,blocked:.issue_dependencies_summary.blocked_by}'`, then drop any ticket with an assignee or `blocked > 0`.
 - **Claim a ticket**: `gh issue edit <n> --add-assignee @me` — do this *first*, before any work.
 - **Resolve a ticket**: `gh issue comment <n> --body "<answer>"` then `gh issue close <n>`, and append the one-line context pointer to the map's `## Decisions so far`.
 
