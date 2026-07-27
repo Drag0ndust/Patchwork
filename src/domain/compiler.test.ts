@@ -305,3 +305,113 @@ describe("compile", () => {
     expect(secondIdx).toBeGreaterThan(firstIdx);
   });
 });
+
+/** A chain that reuses imported artifacts: Input -> Skill -> Prompt -> Agent -> Output. */
+function importedRefDocument(): PatchworkDocument {
+  return {
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    workflow: {
+      name: "Review Change",
+      description: "Implement a change test-first, then review it.",
+    },
+    nodes: [
+      {
+        id: "n1",
+        type: "input",
+        label: "Task",
+        data: { parameters: [{ name: "task", description: "What to build." }] },
+      },
+      {
+        id: "n2",
+        type: "skill",
+        label: "TDD",
+        data: { name: "coding:tdd", rootId: "personal" },
+      },
+      {
+        id: "n3",
+        type: "prompt",
+        label: "Summarize diff",
+        data: { instruction: "Summarize the diff for {task}." },
+      },
+      {
+        id: "n4",
+        type: "agent",
+        label: "Reviewer",
+        data: { name: "pr-reviewer", rootId: "project" },
+      },
+      {
+        id: "n5",
+        type: "output",
+        label: "Verdict",
+        data: { description: "The review digest." },
+      },
+    ],
+    edges: [
+      { id: "e1", source: "n1", target: "n2" },
+      { id: "e2", source: "n2", target: "n3" },
+      { id: "e3", source: "n3", target: "n4" },
+      { id: "e4", source: "n4", target: "n5" },
+    ],
+  };
+}
+
+describe("compile — imported skill/agent nodes are referenced by name", () => {
+  it("given_graphWithImportedRefs_whenCompiling_thenSkillMatchesGoldenFile", () => {
+    const tree = compile(importedRefDocument());
+    const skill = tree.files.find((f) => f.path === "SKILL.md");
+
+    expect(skill?.contents).toBe(readFixture("imported/SKILL.md"));
+  });
+
+  it("given_graphWithImportedRefs_whenCompiling_thenNoArtifactIsCopiedIntoTheBundle", () => {
+    const tree = compile(importedRefDocument());
+
+    expect(tree.files.map((f) => f.path)).toEqual(["SKILL.md"]);
+  });
+
+  it("given_graphWithImportedRefs_whenCompiling_thenStepsFollowChainOrder", () => {
+    const skill = compile(importedRefDocument()).files[0].contents;
+    const steps = skill
+      .split("## Steps\n\n")[1]
+      .split("\n\n")[0]
+      .split("\n");
+
+    expect(steps).toEqual([
+      "1. Invoke the `coding:tdd` skill with the Skill tool, then use its result in the next step.",
+      "2. Summarize the diff for {task}.",
+      "3. Delegate to the `pr-reviewer` subagent with the Task tool, then use its result in the next step.",
+    ]);
+  });
+
+  it("given_graphWithImportedRefs_whenCompiling_thenRequirementsListsEveryReferencedArtifact", () => {
+    const skill = compile(importedRefDocument()).files[0].contents;
+
+    expect(skill).toContain("## Requirements");
+    expect(skill).toContain("- skill `coding:tdd`");
+    expect(skill).toContain("- subagent `pr-reviewer`");
+  });
+
+  it("given_sameSkillReferencedTwice_whenCompiling_thenRequirementsListsItOnce", () => {
+    const doc = importedRefDocument();
+    doc.nodes[2] = {
+      id: "n3",
+      type: "skill",
+      label: "TDD again",
+      data: { name: "coding:tdd", rootId: "personal" },
+    };
+
+    const skill = compile(doc).files[0].contents;
+    const requirements = skill.split("## Requirements\n\n")[1].split("## Steps")[0];
+
+    expect(requirements.match(/- skill `coding:tdd`/g)).toHaveLength(1);
+    expect(skill).toContain(
+      "2. Invoke the `coding:tdd` skill with the Skill tool",
+    );
+  });
+
+  it("given_graphWithoutImportedRefs_whenCompiling_thenNoRequirementsSectionIsEmitted", () => {
+    const skill = compile(canonicalLinearDocument()).files[0].contents;
+
+    expect(skill).not.toContain("## Requirements");
+  });
+});

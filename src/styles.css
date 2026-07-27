@@ -9,6 +9,9 @@
   --pw-input: #34d399;
   --pw-prompt: #818cf8;
   --pw-output: #fbbf24;
+  --pw-skill: #38bdf8;
+  --pw-agent: #f472b6;
+  --pw-warning: #f87171;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
 
@@ -150,6 +153,85 @@ body {
 .pw-node--output {
   border-top: 3px solid var(--pw-output);
 }
+.pw-node--skill {
+  border-top: 3px solid var(--pw-skill);
+}
+.pw-node--agent {
+  border-top: 3px solid var(--pw-agent);
+}
+
+.pw-node.is-unresolved {
+  border-color: var(--pw-warning);
+  border-style: dashed;
+}
+
+.pw-node__warning {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--pw-warning);
+}
+
+/* Source roots bar */
+.pw-roots {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 14px;
+  background: var(--pw-surface);
+  border-bottom: 1px solid var(--pw-border);
+  font-size: 12px;
+  color: var(--pw-muted);
+}
+
+.pw-roots__title {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 11px;
+}
+
+.pw-roots__list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pw-roots__item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--pw-surface-2);
+  border: 1px solid var(--pw-border);
+  border-radius: 999px;
+  padding: 2px 4px 2px 10px;
+}
+
+.pw-roots__role {
+  color: var(--pw-accent);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+
+.pw-roots__item button {
+  background: none;
+  border: none;
+  color: var(--pw-muted);
+  cursor: pointer;
+  padding: 0 6px;
+}
+
+.pw-roots .pw-toolbar__group button {
+  background: var(--pw-surface-2);
+  border: 1px solid var(--pw-border);
+  color: var(--pw-text);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
 
 /* Errors */
 .pw-errors {
@@ -160,6 +242,46 @@ body {
   border-top: 1px solid #7f1d1d;
   color: #fca5a5;
   font-size: 13px;
+}
+
+/* Import notices: collisions, unreadable roots, unresolved references */
+.pw-notices {
+  margin: 0;
+  padding: 8px 16px;
+  list-style: none;
+  background: #2a2313;
+  border-top: 1px solid #78500f;
+  color: #fcd34d;
+  font-size: 12px;
+  max-height: 96px;
+  overflow-y: auto;
+}
+
+/* Artifact picker */
+.pw-field select {
+  background: var(--pw-surface-2);
+  border: 1px solid var(--pw-border);
+  color: var(--pw-text);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  font-family: inherit;
+}
+
+.pw-ref {
+  margin: 0;
+  color: var(--pw-text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.pw-ref code {
+  color: var(--pw-muted);
+  font-size: 11px;
+}
+
+.pw-ref--unresolved {
+  color: var(--pw-warning);
 }
 
 /* Bottom dock editor */

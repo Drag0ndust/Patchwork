@@ -1,11 +1,21 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   CURRENT_SCHEMA_VERSION,
+  type InputData,
   type PatchworkDocument,
   deserialize,
   serialize,
   validateGraph,
 } from "./graph-document";
+
+function readFixture(relativePath: string): string {
+  return readFileSync(
+    fileURLToPath(new URL(`./__fixtures__/${relativePath}`, import.meta.url)),
+    "utf8",
+  );
+}
 
 /** A canonical, well-formed linear graph: Input "topic" -> Prompt -> Output. */
 function linearDocument(): PatchworkDocument {
@@ -394,8 +404,14 @@ describe("serialize/deserialize", () => {
     const doc = linearDocument();
     (doc as { schemaVersion: number }).schemaVersion = 999;
     expect(() => deserialize(JSON.stringify(doc))).toThrow(
-      /schemaVersion 999.*expected 1/i,
+      new RegExp(`schemaVersion 999.*expected 1-${CURRENT_SCHEMA_VERSION}`, "i"),
     );
+  });
+
+  it("given_schemaVersionBelowTheOldestSupported_whenDeserializing_thenThrowsActionableError", () => {
+    const doc = linearDocument();
+    (doc as { schemaVersion: number }).schemaVersion = 0;
+    expect(() => deserialize(JSON.stringify(doc))).toThrow(/schemaVersion 0/);
   });
 
   it("given_documentMissingNodesArray_whenDeserializing_thenThrowsActionableError", () => {
@@ -451,5 +467,231 @@ describe("serialize/deserialize", () => {
     expect(() => deserialize(JSON.stringify(doc))).toThrow(
       /Node 'n2' has invalid type 'transform'/,
     );
+  });
+});
+
+/** A chain that reuses imported artifacts: Input -> Skill -> Agent -> Output. */
+function importedRefDocument(): PatchworkDocument {
+  return {
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    workflow: {
+      name: "Review Change",
+      description: "Implement a change test-first, then review it.",
+    },
+    nodes: [
+      {
+        id: "n1",
+        type: "input",
+        label: "Task",
+        data: { parameters: [{ name: "task", description: "What to build." }] },
+      },
+      {
+        id: "n2",
+        type: "skill",
+        label: "TDD",
+        data: { name: "coding:tdd", rootId: "personal" },
+      },
+      {
+        id: "n3",
+        type: "agent",
+        label: "Reviewer",
+        data: { name: "pr-reviewer", rootId: "project" },
+      },
+      {
+        id: "n4",
+        type: "output",
+        label: "Verdict",
+        data: { description: "The review digest." },
+      },
+    ],
+    edges: [
+      { id: "e1", source: "n1", target: "n2" },
+      { id: "e2", source: "n2", target: "n3" },
+      { id: "e3", source: "n3", target: "n4" },
+    ],
+  };
+}
+
+describe("validateGraph — imported skill/agent nodes", () => {
+  it("given_chainWithSkillAndAgentNodes_whenValidating_thenReturnsOk", () => {
+    expect(validateGraph(importedRefDocument())).toEqual({ ok: true });
+  });
+
+  it("given_skillNodeWithoutArtifactName_whenValidating_thenRejectsWithActionableError", () => {
+    const doc = importedRefDocument();
+    doc.nodes[1].data = { name: "", rootId: "personal" };
+
+    const result = validateGraph(doc);
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected failure");
+    expect(result.errors).toContain(
+      "Skill node 'n2' is not bound to an artifact yet (pick one from a source root)",
+    );
+  });
+
+  it("given_agentNodeWithoutRootPointer_whenValidating_thenRejectsWithActionableError", () => {
+    const doc = importedRefDocument();
+    doc.nodes[2].data = { name: "pr-reviewer", rootId: "" };
+
+    const result = validateGraph(doc);
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected failure");
+    expect(result.errors).toContain(
+      "Agent node 'n3' is missing the source root its artifact came from",
+    );
+  });
+
+  it("given_artifactNameWithBacktick_whenValidating_thenRejectsWithActionableError", () => {
+    const doc = importedRefDocument();
+    doc.nodes[1].data = { name: "tdd`; rm -rf /", rootId: "personal" };
+
+    const result = validateGraph(doc);
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected failure");
+    expect(result.errors.join("\n")).toMatch(/not a usable artifact name/);
+  });
+
+  it("given_documentWithImportedRefs_whenRoundTripped_thenRefsSurvive", () => {
+    const doc = importedRefDocument();
+
+    expect(deserialize(serialize(doc))).toEqual(doc);
+  });
+
+  it("given_skillNodeMissingRootId_whenDeserializing_thenThrowsActionableError", () => {
+    const doc = importedRefDocument();
+    (doc.nodes[1] as { data: unknown }).data = { name: "coding:tdd" };
+
+    expect(() => deserialize(JSON.stringify(doc))).toThrow(
+      /Skill node 'n2' must have a string 'rootId'/,
+    );
+  });
+
+  it("given_agentNodeMissingName_whenDeserializing_thenThrowsActionableError", () => {
+    const doc = importedRefDocument();
+    (doc.nodes[2] as { data: unknown }).data = { rootId: "project" };
+
+    expect(() => deserialize(JSON.stringify(doc))).toThrow(
+      /Agent node 'n3' must have a string 'name'/,
+    );
+  });
+});
+
+describe("deserialize — forward migration", () => {
+  it("given_schemaV1Fixture_whenDeserializing_thenItOpensAtTheCurrentVersion", () => {
+    const migrated = deserialize(readFixture("schema-v1.patchwork"));
+
+    expect(migrated.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+  });
+
+  it("given_schemaV1Fixture_whenDeserializing_thenSemanticsArePreserved", () => {
+    const original = JSON.parse(readFixture("schema-v1.patchwork")) as PatchworkDocument;
+
+    const migrated = deserialize(readFixture("schema-v1.patchwork"));
+
+    expect(migrated.workflow).toEqual(original.workflow);
+    expect(migrated.nodes).toEqual(original.nodes);
+    expect(migrated.edges).toEqual(original.edges);
+  });
+
+  it("given_schemaV1Fixture_whenMigratedAndValidated_thenItIsStillAValidGraph", () => {
+    expect(validateGraph(deserialize(readFixture("schema-v1.patchwork")))).toEqual({
+      ok: true,
+    });
+  });
+
+  it("given_migratedV1Document_whenReserialized_thenItIsStoredAtTheCurrentVersion", () => {
+    const reserialized = serialize(deserialize(readFixture("schema-v1.patchwork")));
+
+    expect(JSON.parse(reserialized).schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+  });
+});
+
+describe("deserialize — fields the canvas renders directly", () => {
+  it("given_nonStringLabel_whenDeserializing_thenThrowsInsteadOfCrashingTheRenderLater", () => {
+    const doc = linearDocument();
+    (doc.nodes[1] as { label: unknown }).label = { evil: 1 };
+
+    expect(() => deserialize(JSON.stringify(doc))).toThrow(
+      /Node 'n2' must have a string 'label' \(found a object\)/,
+    );
+  });
+
+  it("given_missingLabel_whenDeserializing_thenThrowsActionableError", () => {
+    const doc = linearDocument() as { nodes: Array<Record<string, unknown>> };
+    delete doc.nodes[0].label;
+
+    expect(() => deserialize(JSON.stringify(doc))).toThrow(/'label'/);
+  });
+
+  it.each([
+    ["a string", "nope"],
+    ["an array", [1, 2]],
+    ["a partial pair", { x: 1 }],
+    ["non-numeric coordinates", { x: "1", y: "2" }],
+    ["null", null],
+    ["NaN", { x: Number.NaN, y: 0 }],
+  ])(
+    "given_position_that_is_%s_whenDeserializing_thenThrowsActionableError",
+    (_case, position) => {
+      const doc = linearDocument();
+      (doc.nodes[0] as { position: unknown }).position = position;
+
+      expect(() => deserialize(JSON.stringify(doc))).toThrow(
+        /Node 'n1' has an invalid 'position'/,
+      );
+    },
+  );
+
+  it("given_wellFormedPosition_whenDeserializing_thenItIsAccepted", () => {
+    const doc = linearDocument();
+    doc.nodes[0].position = { x: 12, y: -4 };
+
+    expect(deserialize(JSON.stringify(doc)).nodes[0].position).toEqual({ x: 12, y: -4 });
+  });
+});
+
+describe("deserialize — optional free-text fields", () => {
+  it.each([
+    ["an object", { evil: 1 }],
+    ["a number", 42],
+    ["a boolean", true],
+    ["an array", ["a"]],
+  ])(
+    "given_workflowDescription_that_is_%s_whenDeserializing_thenThrowsActionableError",
+    (_case, description) => {
+      const doc = linearDocument();
+      (doc.workflow as { description: unknown }).description = description;
+
+      expect(() => deserialize(JSON.stringify(doc))).toThrow(
+        /Workflow 'description' must be a string when present/,
+      );
+    },
+  );
+
+  it("given_absentWorkflowDescription_whenDeserializing_thenItIsAccepted", () => {
+    const doc = linearDocument() as { workflow: Record<string, unknown> };
+    delete doc.workflow.description;
+
+    expect(() => deserialize(JSON.stringify(doc))).not.toThrow();
+  });
+
+  it("given_parameterDescription_thatIsNotAString_whenDeserializing_thenThrowsActionableError", () => {
+    const doc = linearDocument();
+    (doc.nodes[0].data as InputData).parameters[0].description = { evil: 1 } as never;
+
+    expect(() => deserialize(JSON.stringify(doc))).toThrow(
+      /Input node 'n1' parameter 0 'description' must be a string when present/,
+    );
+  });
+
+  it("given_everyFreeTextFieldWellFormed_whenDeserializedAndCompiled_thenNothingThrows", () => {
+    // The class of defect this closes: a value that passes validation and then
+    // throws inside a downstream string operation.
+    const doc = deserialize(serialize(linearDocument()));
+
+    expect(() => validateGraph(doc)).not.toThrow();
   });
 });

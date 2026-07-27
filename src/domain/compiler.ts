@@ -9,7 +9,9 @@
  */
 
 import { stringify as stringifyYaml } from "yaml";
+import { artifactKindOf } from "./graph-document";
 import type {
+  ArtifactRefData,
   GraphNode,
   InputData,
   OutputData,
@@ -134,12 +136,45 @@ function linearOrder(doc: PatchworkDocument): GraphNode[] {
   return ordered;
 }
 
+/**
+ * Render one step of the chain.
+ *
+ * A `Prompt` node inlines its instruction. A `Skill`/`Agent` node is emitted as
+ * **reference-by-name**: the prose tells Claude Code to invoke the artifact the
+ * user already has installed. The artifact body is deliberately NOT copied into
+ * the bundle — vendor-copy is a separate, per-node export choice.
+ */
+function stepInstruction(node: GraphNode): string {
+  switch (node.type) {
+    case "skill":
+      return `Invoke the \`${codeSpanText((node.data as ArtifactRefData).name)}\` skill with the Skill tool, then use its result in the next step.`;
+    case "agent":
+      return `Delegate to the \`${codeSpanText((node.data as ArtifactRefData).name)}\` subagent with the Task tool, then use its result in the next step.`;
+    default:
+      return sanitizeInline((node.data as PromptData | undefined)?.instruction);
+  }
+}
+
+/** The referenced (not bundled) artifacts, deduplicated, in chain order. */
+function referencedArtifacts(ordered: GraphNode[]): GraphNode[] {
+  const seen = new Set<string>();
+  return ordered.filter((node) => {
+    const kind = artifactKindOf(node.type);
+    if (!kind) return false;
+    const key = `${kind} ${(node.data as ArtifactRefData).name}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function renderSkill(doc: PatchworkDocument, ordered: GraphNode[]): string {
   const slug = slugify(doc.workflow.name ?? "");
   const description = doc.workflow.description ?? "";
 
   const input = ordered.find((n) => n.type === "input");
-  const prompts = ordered.filter((n) => n.type === "prompt");
+  const steps = ordered.filter((n) => n.type !== "input" && n.type !== "output");
+  const references = referencedArtifacts(ordered);
   const output = ordered.find((n) => n.type === "output");
 
   const rawParameters = (input?.data as InputData | undefined)?.parameters;
@@ -181,14 +216,27 @@ function renderSkill(doc: PatchworkDocument, ordered: GraphNode[]): string {
   }
   lines.push("");
 
+  if (references.length > 0) {
+    lines.push("## Requirements");
+    lines.push("");
+    lines.push(
+      "This workflow references capabilities by name — they are not bundled here, so they must already be installed in Claude Code:",
+    );
+    lines.push("");
+    for (const node of references) {
+      const name = codeSpanText((node.data as ArtifactRefData).name);
+      lines.push(`- ${node.type === "skill" ? "skill" : "subagent"} \`${name}\``);
+    }
+    lines.push("");
+  }
+
   lines.push("## Steps");
   lines.push("");
-  if (prompts.length === 0) {
+  if (steps.length === 0) {
     lines.push("_No steps defined._");
   } else {
-    prompts.forEach((prompt, index) => {
-      const instruction = sanitizeInline((prompt.data as PromptData | undefined)?.instruction);
-      lines.push(`${index + 1}. ${instruction}`);
+    steps.forEach((step, index) => {
+      lines.push(`${index + 1}. ${stepInstruction(step)}`);
     });
   }
   lines.push("");

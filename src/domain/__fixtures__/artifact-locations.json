@@ -1,0 +1,120 @@
+{
+  "$comment": [
+    "The single source of truth for the artifact naming rule, read by BOTH sides of",
+    "the command boundary: `parseArtifactLocation` (src/domain/artifact-codec.ts) and",
+    "the walk in `scan_roots` (src-tauri/src/lib.rs). Add a case here first; both",
+    "test suites pick it up.",
+    "",
+    "`path` is relative to a source root. `artifact` is null when the path is NOT an",
+    "importable artifact. The layout is bounded: at most one namespace segment, and",
+    "only from a plugin directory.",
+    "",
+    "Status: this table is a SPECIFICATION. The walk in scan_roots is the",
+    "production implementation of the rule; parseArtifactLocation is the pure TS",
+    "statement of it and currently has no production caller (vendor-copy, a later",
+    "slice, is its intended use). The value here is that the rule cannot drift on",
+    "one side of the boundary unnoticed.",
+    "",
+    "One asymmetry the table cannot express: the walk additionally requires a",
+    "`.claude-plugin/` marker directory before treating `<x>/skills/...` as a plugin,",
+    "which is a filesystem fact the pure TS rule cannot see. Every path below is one",
+    "where both sides agree; the marker-less case is covered by a Rust-only test."
+  ],
+  "files": [
+    {
+      "path": "skills/tdd/SKILL.md",
+      "artifact": { "kind": "skill", "name": "tdd" },
+      "why": "flat personal skill: a directory holding SKILL.md"
+    },
+    {
+      "path": "agents/reviewer.md",
+      "artifact": { "kind": "agent", "name": "reviewer" },
+      "why": "flat personal agent: a single file"
+    },
+    {
+      "path": "skills/coding/.claude-plugin/plugin.json",
+      "artifact": null,
+      "why": "the plugin marker itself is not an artifact"
+    },
+    {
+      "path": "skills/coding/skills/tdd/SKILL.md",
+      "artifact": { "kind": "skill", "name": "coding:tdd" },
+      "why": "plugin skill: the plugin directory is the one namespace segment"
+    },
+    {
+      "path": "skills/coding/agents/pr-reviewer.md",
+      "artifact": { "kind": "agent", "name": "coding:pr-reviewer" },
+      "why": "plugin agent: same namespace, single file"
+    },
+    {
+      "path": "skills/graphify/.claude-plugin/plugin.json",
+      "artifact": null,
+      "why": "marker for a single-skill plugin"
+    },
+    {
+      "path": "skills/graphify/SKILL.md",
+      "artifact": { "kind": "skill", "name": "graphify" },
+      "why": "a plugin whose SKILL.md sits at its root is invoked by the plugin name alone"
+    },
+    {
+      "path": "skills/coding/references/guide.md",
+      "artifact": null,
+      "why": "a plugin's reference material is not an artifact"
+    },
+    {
+      "path": "skills/coding/references/vendored/SKILL.md",
+      "artifact": null,
+      "why": "a vendored SKILL.md below a plugin must never become an importable skill"
+    },
+    {
+      "path": "skills/coding/skills/tdd/references/nested/SKILL.md",
+      "artifact": null,
+      "why": "nesting deeper than one namespace segment is not a real layout"
+    },
+    {
+      "path": "skills/coding/skills/SKILL.md",
+      "artifact": null,
+      "why": "no directory name to be invoked by"
+    },
+    {
+      "path": "skills/coding/agents/SKILL.md",
+      "artifact": null,
+      "why": "a SKILL.md misplaced in agents/ must not claim the plugin's own name"
+    },
+    {
+      "path": "skills/coding/loose.md",
+      "artifact": null,
+      "why": "a loose Markdown file in a plugin root is not an agent"
+    },
+    {
+      "path": "skills/SKILL.md",
+      "artifact": null,
+      "why": "no directory name to be invoked by"
+    },
+    {
+      "path": "skills/notes.md",
+      "artifact": null,
+      "why": "a loose Markdown file beside the skills is not an artifact"
+    },
+    {
+      "path": "skills/not-a-skill/README.md",
+      "artifact": null,
+      "why": "a directory without SKILL.md holds no skill"
+    },
+    {
+      "path": "agents/SKILL.md",
+      "artifact": null,
+      "why": "agents are never named SKILL"
+    },
+    {
+      "path": "agents/nested/reviewer.md",
+      "artifact": null,
+      "why": "the personal agents directory is flat; nesting is not a real layout"
+    },
+    {
+      "path": "docs/coding/guide.md",
+      "artifact": null,
+      "why": "outside skills/ and agents/ entirely"
+    }
+  ]
+}

@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "workflow": {
+    "name": "Summarize Topic",
+    "description": "Summarize a topic into a short paragraph."
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "type": "input",
+      "label": "Topic",
+      "data": {
+        "parameters": [
+          {
+            "name": "topic",
+            "description": "The subject to summarize."
+          }
+        ]
+      },
+      "position": {
+        "x": 120,
+        "y": 120
+      }
+    },
+    {
+      "id": "n2",
+      "type": "prompt",
+      "label": "Summarize",
+      "data": {
+        "instruction": "Summarize {topic} in one concise paragraph."
+      },
+      "position": {
+        "x": 380,
+        "y": 160
+      }
+    },
+    {
+      "id": "n3",
+      "type": "output",
+      "label": "Summary",
+      "data": {
+        "description": "A one-paragraph summary of the topic."
+      },
+      "position": {
+        "x": 640,
+        "y": 200
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "source": "n1",
+      "target": "n2"
+    },
+    {
+      "id": "e2",
+      "source": "n2",
+      "target": "n3"
+    }
+  ]
+}
