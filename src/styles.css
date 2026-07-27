@@ -1,0 +1,255 @@
+:root {
+  --pw-bg: #0f1117;
+  --pw-surface: #171a23;
+  --pw-surface-2: #1f2430;
+  --pw-border: #2b3140;
+  --pw-text: #e6e8ee;
+  --pw-muted: #8b93a7;
+  --pw-accent: #6366f1;
+  --pw-input: #34d399;
+  --pw-prompt: #818cf8;
+  --pw-output: #fbbf24;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--pw-bg);
+  color: var(--pw-text);
+}
+
+.pw-app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* Toolbar */
+.pw-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--pw-surface);
+  border-bottom: 1px solid var(--pw-border);
+}
+
+.pw-brand {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.pw-workflow-name,
+.pw-workflow-description {
+  background: var(--pw-surface-2);
+  border: 1px solid var(--pw-border);
+  color: var(--pw-text);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+
+.pw-workflow-name {
+  min-width: 160px;
+}
+
+.pw-workflow-description {
+  min-width: 260px;
+  flex: 1;
+  max-width: 420px;
+}
+
+.pw-toolbar__group {
+  display: flex;
+  gap: 6px;
+}
+
+.pw-toolbar__group--end {
+  margin-left: auto;
+}
+
+.pw-toolbar button {
+  background: var(--pw-surface-2);
+  border: 1px solid var(--pw-border);
+  color: var(--pw-text);
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.pw-toolbar button:hover {
+  border-color: var(--pw-accent);
+}
+
+.pw-toolbar button.pw-primary {
+  background: var(--pw-accent);
+  border-color: var(--pw-accent);
+  color: white;
+  font-weight: 600;
+}
+
+/* Canvas */
+.pw-canvas {
+  flex: 1;
+  min-height: 0;
+}
+
+.react-flow {
+  background: var(--pw-bg);
+}
+
+/* Nodes */
+.pw-node {
+  width: 190px;
+  border-radius: 10px;
+  border: 1px solid var(--pw-border);
+  background: var(--pw-surface-2);
+  padding: 10px 12px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.pw-node.is-selected {
+  outline: 2px solid var(--pw-accent);
+}
+
+.pw-node__type {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--pw-muted);
+  margin-bottom: 4px;
+}
+
+.pw-node__label {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.pw-node__detail {
+  font-size: 12px;
+  color: var(--pw-muted);
+  word-break: break-word;
+}
+
+.pw-node--input {
+  border-top: 3px solid var(--pw-input);
+}
+.pw-node--prompt {
+  border-top: 3px solid var(--pw-prompt);
+}
+.pw-node--output {
+  border-top: 3px solid var(--pw-output);
+}
+
+/* Errors */
+.pw-errors {
+  margin: 0;
+  padding: 8px 16px;
+  list-style: none;
+  background: #3b1220;
+  border-top: 1px solid #7f1d1d;
+  color: #fca5a5;
+  font-size: 13px;
+}
+
+/* Bottom dock editor */
+.pw-dock {
+  border-top: 1px solid var(--pw-border);
+  background: var(--pw-surface);
+  padding: 12px 16px;
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  min-height: 96px;
+}
+
+.pw-dock--empty {
+  color: var(--pw-muted);
+  align-items: center;
+}
+
+.pw-dock__title {
+  font-weight: 600;
+  width: 100%;
+}
+
+.pw-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--pw-muted);
+  min-width: 200px;
+}
+
+.pw-field--grow {
+  flex: 1;
+}
+
+.pw-field input,
+.pw-field textarea {
+  background: var(--pw-surface-2);
+  border: 1px solid var(--pw-border);
+  color: var(--pw-text);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  font-family: inherit;
+}
+
+.pw-field textarea {
+  min-height: 56px;
+  resize: vertical;
+}
+
+/* Crash fallback (error boundary) */
+.pw-crash {
+  margin: 48px auto;
+  max-width: 520px;
+  padding: 24px 28px;
+  background: var(--pw-surface);
+  border: 1px solid #7f1d1d;
+  border-radius: 12px;
+  color: var(--pw-text);
+}
+
+.pw-crash h1 {
+  margin-top: 0;
+  font-size: 18px;
+}
+
+.pw-crash p {
+  color: #fca5a5;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  word-break: break-word;
+}
+
+.pw-crash button {
+  background: var(--pw-accent);
+  border: none;
+  color: white;
+  border-radius: 6px;
+  padding: 8px 16px;
+  cursor: pointer;
+}
+
+/* Status bar */
+.pw-status {
+  padding: 6px 16px;
+  background: var(--pw-surface-2);
+  border-top: 1px solid var(--pw-border);
+  font-size: 12px;
+  color: var(--pw-muted);
+}
