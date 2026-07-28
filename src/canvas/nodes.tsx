@@ -1,5 +1,10 @@
 import { Handle, Position, type NodeProps } from "@xyflow/react";
-import type { InputData, OutputData, PromptData } from "../domain/graph-document";
+import type {
+  ArtifactRefData,
+  InputData,
+  OutputData,
+  PromptData,
+} from "../domain/graph-document";
 import type { PatchNode } from "./react-flow-adapter";
 
 function summarize(text: string, max = 64): string {
@@ -53,8 +58,53 @@ export function OutputNode({ data, selected }: NodeProps<PatchNode>) {
   );
 }
 
+/**
+ * A node bound to an imported artifact. Rendered for both kinds, because the
+ * only difference on the canvas is the label and how the reference is invoked.
+ */
+function ArtifactRefNode({
+  data,
+  selected,
+  kind,
+}: NodeProps<PatchNode> & { kind: "skill" | "agent" }) {
+  const ref = data.node as ArtifactRefData | undefined;
+  const name = ref?.name ?? "";
+  const unresolved = data.unresolved === true;
+
+  return (
+    <div
+      className={`pw-node pw-node--${kind}${selected ? " is-selected" : ""}${
+        unresolved ? " is-unresolved" : ""
+      }`}
+    >
+      <Handle type="target" position={Position.Left} />
+      <header className="pw-node__type">{kind === "skill" ? "Skill" : "Agent"}</header>
+      <div className="pw-node__label">
+        {data.label || (kind === "skill" ? "Untitled skill" : "Untitled agent")}
+      </div>
+      <div className="pw-node__detail">
+        {name === "" ? "no artifact bound" : name}
+      </div>
+      {unresolved && (
+        <div className="pw-node__warning">unresolved — not in any source root</div>
+      )}
+      <Handle type="source" position={Position.Right} />
+    </div>
+  );
+}
+
+export function SkillNode(props: NodeProps<PatchNode>) {
+  return <ArtifactRefNode {...props} kind="skill" />;
+}
+
+export function AgentNode(props: NodeProps<PatchNode>) {
+  return <ArtifactRefNode {...props} kind="agent" />;
+}
+
 export const nodeTypes = {
   input: InputNode,
   prompt: PromptNode,
   output: OutputNode,
+  skill: SkillNode,
+  agent: AgentNode,
 };

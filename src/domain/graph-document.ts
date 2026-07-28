@@ -6,11 +6,25 @@
  * canvas, but the document itself is the source of truth for compilation.
  */
 
-export const CURRENT_SCHEMA_VERSION = 1;
+import { isValidArtifactName, type ArtifactKind } from "./artifact-codec";
 
-export type NodeType = "input" | "prompt" | "output";
+/**
+ * Bumped to 2 in slice 2: the palette grew `skill`/`agent` nodes that carry an
+ * imported artifact reference. `deserialize` migrates older documents forward.
+ */
+export const CURRENT_SCHEMA_VERSION = 2;
 
-const NODE_TYPES: NodeType[] = ["input", "prompt", "output"];
+/** The oldest document version that still opens (via forward migration). */
+export const MIN_SUPPORTED_SCHEMA_VERSION = 1;
+
+export type NodeType = "input" | "prompt" | "output" | "skill" | "agent";
+
+const NODE_TYPES: NodeType[] = ["input", "prompt", "output", "skill", "agent"];
+
+/** The `skill`/`agent` node types map 1:1 onto the codec's artifact kinds. */
+export function artifactKindOf(type: NodeType): ArtifactKind | null {
+  return type === "skill" || type === "agent" ? type : null;
+}
 
 export interface Parameter {
   name: string;
@@ -29,7 +43,21 @@ export interface OutputData {
   description: string;
 }
 
-export type NodeData = InputData | PromptData | OutputData;
+/**
+ * A `skill`/`agent` node's binding to an artifact that lives in one of the
+ * user's source roots.
+ *
+ * The reference is deliberately **symbolic**: the artifact's name plus the id
+ * of the configured root it was imported from — never an absolute path. That
+ * way precedence resolution re-runs every time the document is opened, and a
+ * moved or removed root leaves the node unresolved instead of stale.
+ */
+export interface ArtifactRefData {
+  name: string;
+  rootId: string;
+}
+
+export type NodeData = InputData | PromptData | OutputData | ArtifactRefData;
 
 export interface Position {
   x: number;
@@ -172,7 +200,34 @@ function contentErrors(doc: PatchworkDocument): string[] {
       if (((node.data as OutputData).description ?? "").trim() === "") {
         errors.push(`Output node '${node.id}' has an empty description`);
       }
+    } else if (artifactKindOf(node.type)) {
+      errors.push(...artifactRefErrors(node));
     }
+  }
+  return errors;
+}
+
+/** Reject a `skill`/`agent` node that is not bound to a usable artifact. */
+function artifactRefErrors(node: GraphNode): string[] {
+  const errors: string[] = [];
+  const label = node.type === "skill" ? "Skill" : "Agent";
+  const ref = node.data as ArtifactRefData;
+  const name = (ref.name ?? "").trim();
+
+  if (name === "") {
+    errors.push(
+      `${label} node '${node.id}' is not bound to an artifact yet (pick one from a source root)`,
+    );
+  } else if (!isValidArtifactName(name)) {
+    // The name is rendered into an inline code span in the umbrella skill.
+    errors.push(
+      `${label} node '${node.id}' references '${ref.name}', which is not a usable artifact name`,
+    );
+  }
+  if ((ref.rootId ?? "").trim() === "") {
+    errors.push(
+      `${label} node '${node.id}' is missing the source root its artifact came from`,
+    );
   }
   return errors;
 }
@@ -299,9 +354,13 @@ export function deserialize(json: string): PatchworkDocument {
       "File is not a Patchwork document (missing numeric 'schemaVersion' field)",
     );
   }
-  if (doc.schemaVersion !== CURRENT_SCHEMA_VERSION) {
+  if (
+    doc.schemaVersion < MIN_SUPPORTED_SCHEMA_VERSION ||
+    doc.schemaVersion > CURRENT_SCHEMA_VERSION ||
+    !Number.isInteger(doc.schemaVersion)
+  ) {
     throw new Error(
-      `Unsupported schemaVersion ${doc.schemaVersion} (expected ${CURRENT_SCHEMA_VERSION}). This file was created by a different version of Patchwork.`,
+      `Unsupported schemaVersion ${doc.schemaVersion} (expected ${MIN_SUPPORTED_SCHEMA_VERSION}-${CURRENT_SCHEMA_VERSION}). This file was created by a different version of Patchwork.`,
     );
   }
 
@@ -314,6 +373,14 @@ export function deserialize(json: string): PatchworkDocument {
       "Malformed Patchwork document: 'workflow' must be an object with a 'name'",
     );
   }
+  // Every free-text field is validated, not just the required ones: downstream
+  // consumers call string methods on them (`validateGraph` trims the workflow
+  // description, `compile` sanitizes parameter descriptions), and a wrong type
+  // there surfaces as a TypeError far from the file that caused it.
+  assertOptionalText(
+    (doc.workflow as { description?: unknown }).description,
+    "Workflow 'description'",
+  );
   if (!Array.isArray(doc.nodes)) {
     throw new Error("Malformed Patchwork document: 'nodes' must be an array");
   }
@@ -324,7 +391,43 @@ export function deserialize(json: string): PatchworkDocument {
   doc.nodes.forEach(assertNodeShape);
   doc.edges.forEach(assertEdgeShape);
 
-  return parsed as PatchworkDocument;
+  return migrateToCurrent(doc as unknown as PatchworkDocument);
+}
+
+/**
+ * Forward migrations, keyed by the version they migrate *from*. Each step
+ * upgrades a document by exactly one version, so a v1 file walks the whole
+ * chain to the current version. Old files must keep opening — a migration may
+ * never throw away data it does not understand.
+ *
+ * **Shape validation runs before migration**, against the *current* `NODE_TYPES`
+ * and per-type `data` contracts. That holds only while every supported version's
+ * node shapes are also valid under today's contracts — true for v1 -> v2, which
+ * added node types without changing a field. The first migration that *renames or
+ * retypes* a node's `data`, or retires a node type, would therefore see its input
+ * rejected by validation before it could ever run: adding such a step means
+ * moving `assertNodeShape`/`assertEdgeShape` after `migrateToCurrent` (and
+ * hardening the migrations themselves against malformed input, which validation
+ * currently spares them).
+ */
+const MIGRATIONS: Record<number, (doc: PatchworkDocument) => PatchworkDocument> = {
+  // v1 -> v2: `skill`/`agent` nodes were added to the palette. No existing
+  // field changed shape, so a v1 document is already a valid v2 document.
+  1: (doc) => ({ ...doc, schemaVersion: 2 }),
+};
+
+function migrateToCurrent(doc: PatchworkDocument): PatchworkDocument {
+  let migrated = doc;
+  while (migrated.schemaVersion < CURRENT_SCHEMA_VERSION) {
+    const step = MIGRATIONS[migrated.schemaVersion];
+    if (!step) {
+      throw new Error(
+        `No migration available from schemaVersion ${migrated.schemaVersion} to ${CURRENT_SCHEMA_VERSION}`,
+      );
+    }
+    migrated = step(migrated);
+  }
+  return migrated;
 }
 
 /** Reject a node whose `type`/`data` shape would crash the canvas or compiler. */
@@ -344,8 +447,29 @@ function assertNodeShape(raw: unknown, index: number): void {
   }
   if (typeof node.type !== "string" || !NODE_TYPES.includes(node.type as NodeType)) {
     throw new Error(
-      `Node '${id}' has invalid type '${String(node.type)}' (expected input, prompt, or output)`,
+      `Node '${id}' has invalid type '${String(node.type)}' (expected one of ${NODE_TYPES.join(", ")})`,
     );
+  }
+  // `label` is rendered as a React child and `position` is handed to the canvas,
+  // so a wrong type here would throw during render — past validation, where the
+  // error boundary can only offer to discard the whole session.
+  if (typeof node.label !== "string") {
+    throw new Error(
+      `Node '${id}' must have a string 'label' (found ${describeType(node.label)})`,
+    );
+  }
+  if (node.position !== undefined) {
+    const position = node.position as Record<string, unknown> | null;
+    if (
+      typeof position !== "object" ||
+      position === null ||
+      !Number.isFinite(position.x as number) ||
+      !Number.isFinite(position.y as number)
+    ) {
+      throw new Error(
+        `Node '${id}' has an invalid 'position' (expected {x, y} numbers, found ${describeType(node.position)})`,
+      );
+    }
   }
   if (typeof node.data !== "object" || node.data === null) {
     throw new Error(`Node '${id}' is missing its 'data' object`);
@@ -367,6 +491,10 @@ function assertNodeShape(raw: unknown, index: number): void {
             `Input node '${id}' parameter ${i} must have a string 'name'`,
           );
         }
+        assertOptionalText(
+          (param as Record<string, unknown>).description,
+          `Input node '${id}' parameter ${i} 'description'`,
+        );
       });
       break;
     }
@@ -380,7 +508,44 @@ function assertNodeShape(raw: unknown, index: number): void {
         throw new Error(`Output node '${id}' must have a string 'description'`);
       }
       break;
+    case "skill":
+    case "agent": {
+      const label = node.type === "skill" ? "Skill" : "Agent";
+      if (typeof data.name !== "string") {
+        throw new Error(
+          `${label} node '${id}' must have a string 'name' naming the referenced artifact`,
+        );
+      }
+      if (typeof data.rootId !== "string") {
+        throw new Error(
+          `${label} node '${id}' must have a string 'rootId' pointing at a configured source root`,
+        );
+      }
+      break;
+    }
   }
+}
+
+/**
+ * Require an optional free-text field to be a string when present.
+ *
+ * Absent and empty are fine (validation decides whether they are acceptable);
+ * a number, object, or array is not, because something downstream will treat it
+ * as a string.
+ */
+function assertOptionalText(value: unknown, label: string): void {
+  if (value !== undefined && typeof value !== "string") {
+    throw new Error(
+      `Malformed Patchwork document: ${label} must be a string when present (found ${describeType(value)})`,
+    );
+  }
+}
+
+/** A short, safe description of an unexpected value's type for error messages. */
+function describeType(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "an array";
+  return `a ${typeof value}`;
 }
 
 /** Reject an edge missing the string endpoints the canvas adapter relies on. */

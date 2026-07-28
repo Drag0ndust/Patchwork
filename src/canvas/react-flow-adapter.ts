@@ -1,17 +1,26 @@
 import type { Edge, Node } from "@xyflow/react";
 import {
   CURRENT_SCHEMA_VERSION,
+  artifactKindOf,
+  type ArtifactRefData,
   type GraphEdge,
   type NodeData,
   type NodeType,
   type PatchworkDocument,
   type WorkflowMeta,
 } from "../domain/graph-document";
+import { findCatalogArtifact, type ImportCatalog } from "../import/catalog";
 
 /** Data carried on each React Flow node. */
 export interface PatchNodeData extends Record<string, unknown> {
   label: string;
   node: NodeData;
+  /**
+   * Set on `skill`/`agent` nodes whose imported artifact is not in any
+   * configured root right now. Derived state — never persisted, because the
+   * document stores the reference symbolically and resolution re-runs on open.
+   */
+  unresolved?: boolean;
 }
 
 export type PatchNode = Node<PatchNodeData>;
@@ -38,6 +47,39 @@ export function documentToFlow(doc: PatchworkDocument): FlowGraph {
       target: e.target,
     })),
   };
+}
+
+/**
+ * Re-run reference resolution over the canvas.
+ *
+ * Called whenever a document is opened or the roots are rescanned: a node whose
+ * artifact has moved or been deleted is flagged rather than dropped, so a stale
+ * reference can never cost the user their graph.
+ */
+export function applyResolution(
+  nodes: readonly PatchNode[],
+  catalog: ImportCatalog,
+): PatchNode[] {
+  let changed = false;
+  const resolved = nodes.map((node) => {
+    const kind = artifactKindOf(node.type as NodeType);
+    if (!kind) return node;
+    // Resolution is by kind+name only, deliberately: the stored `rootId` records
+    // where the artifact came from when the document was saved, but precedence
+    // re-runs against the roots configured *now*, so the winning root may
+    // legitimately differ. Matching on rootId would defeat that contract.
+    const { name } = node.data.node as ArtifactRefData;
+    // An unbound node references nothing yet, so it cannot be *un*resolved — the
+    // node body already says "no artifact bound". Flagging it here would also add
+    // it to App's "reference an artifact that is not in any configured source
+    // root" notice, which would be claiming a reference that does not exist.
+    const unresolved = name !== "" && !findCatalogArtifact(catalog, kind, name);
+    if (node.data.unresolved === unresolved) return node;
+    changed = true;
+    return { ...node, data: { ...node.data, unresolved } };
+  });
+  // Identity-stable when nothing moved, so React/React Flow can skip the update.
+  return changed ? resolved : (nodes as PatchNode[]);
 }
 
 /** Rebuild a Patchwork document from the current canvas state. */

@@ -19,7 +19,22 @@ canvas and exporting them as runnable Claude Code skill bundles.
   raw React Flow dump.
 - **Graph Compiler** (`src/domain/compiler.ts`) — pure `compile(doc)` producing
   an in-memory `BundleTree` (no IO). Emits an umbrella `SKILL.md` whose prose
-  encodes the linear Input → Prompt(s) → Output order.
+  encodes the linear Input → step(s) → Output order. Imported `Skill`/`Agent`
+  nodes are emitted as **reference-by-name** (the artifact is not copied).
+- **Artifact Codec** (`src/domain/artifact-codec.ts`) — pure parse/emit for the
+  two on-disk formats, and the one place that knows a skill is a *directory*
+  containing `SKILL.md` while an agent is a *single file* `agents/<name>.md`.
+  `parseArtifactLocation` states the naming rule: the layout is **bounded** to at
+  most one namespace segment, taken from a plugin directory
+  (`skills/<plugin>/skills/<name>/SKILL.md` → `<plugin>:<name>`). The rule is
+  checked in once, in `src/domain/__fixtures__/artifact-locations.json`, and
+  exercised from **both** the TS and Rust test suites.
+- **Root Resolver** (`src/domain/root-resolver.ts`) — pure precedence over
+  artifact listings: skills personal > project, agents project > personal.
+- **Import Scanner** — a thin shell: the privileged walk lives in Rust
+  (`src-tauri/src/lib.rs`, `scan_roots`), the decisions live in
+  `src/import/catalog.ts` (parse + resolve) and `src/import/source-roots.ts`
+  (the configured roots, default `~/.claude`).
 - **Bundle Emitter** (`src-tauri/src/lib.rs`, `export_bundle`) — writes the tree
   to disk with a clean-overwrite guarantee.
 
