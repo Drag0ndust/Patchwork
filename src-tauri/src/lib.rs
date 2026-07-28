@@ -4,7 +4,8 @@
 //! filesystem work lives here:
 //!
 //! - [`export_bundle`] is the **Bundle Emitter**: it writes a compiled
-//!   [`BundleTree`] to disk with a clean-overwrite guarantee.
+//!   [`BundleTree`] to disk, all-or-nothing, replacing any previous bundle only
+//!   once the new one is complete.
 //! - [`read_document`] / [`write_document`] persist the `.patchwork` file.
 //! - [`scan_roots`] is the **Import Scanner**'s privileged half: it walks the
 //!   user's configured source roots and hands raw artifact bytes to the TS side,
@@ -79,9 +80,19 @@ fn validate_bundle_paths(tree: &BundleTree) -> Result<(), String> {
 
 /// Write a bundle tree under `dest_dir`, replacing any existing bundle dir.
 ///
-/// The clean-overwrite contract: if `dest_dir/<dirName>` already exists it is
-/// removed entirely before writing, so stale files from a previous export can
-/// never linger. Returns the absolute path of the written bundle directory.
+/// **All-or-nothing.** The tree is written to a staging directory beside the
+/// destination and only then swapped in, so an export either replaces the bundle
+/// completely or leaves the previous one exactly as it was. Returns the absolute
+/// path of the written bundle directory.
+///
+/// Why staging rather than clearing the destination first: since vendor-copy a
+/// bundle is N files, and the Graph Compiler writes the umbrella and the
+/// `.claude-plugin/` marker **last** precisely because they are what makes a
+/// bundle discoverable. Clearing up front would mean any mid-write failure — a
+/// full disk, a revoked permission, a network volume dropping — destroyed a
+/// working bundle and left a *discoverable* plugin whose steps instruct copies
+/// that never landed. Staging removes the window instead of narrowing it, and it
+/// covers a second process exporting concurrently, which no in-process lock could.
 ///
 /// Paths are validated *before* any filesystem mutation so a malicious or
 /// buggy renderer cannot direct the recursive delete/write outside `dest_dir`.
@@ -89,16 +100,70 @@ pub fn write_bundle(tree: &BundleTree, dest_dir: &Path) -> Result<PathBuf, Strin
     validate_bundle_paths(tree)?;
 
     let bundle_dir = dest_dir.join(&tree.dir_name);
+    let staging = dest_dir.join(staging_name(&tree.dir_name, "staging"));
 
-    if bundle_dir.exists() {
-        fs::remove_dir_all(&bundle_dir)
-            .map_err(|e| format!("Failed to clear existing bundle at {bundle_dir:?}: {e}"))?;
+    // Created before anything is written into it, and separately from the fill, so
+    // that every `remove_dir_all(&staging)` below can only ever remove a directory
+    // *this* export made: a staging path that already existed is refused here and
+    // returns without a cleanup, leaving whatever is there untouched.
+    create_staging(&staging)?;
+
+    // Fill the staging directory first; nothing at the destination is touched
+    // until it holds the complete bundle.
+    if let Err(e) = fill_staging(tree, &staging) {
+        // Best-effort: the failure being reported is the one worth reporting.
+        let _ = fs::remove_dir_all(&staging);
+        return Err(e);
     }
-    fs::create_dir_all(&bundle_dir)
-        .map_err(|e| format!("Failed to create bundle directory {bundle_dir:?}: {e}"))?;
 
+    match swap_in(&staging, &bundle_dir, &tree.dir_name, dest_dir) {
+        Ok(()) => Ok(bundle_dir),
+        Err(e) => {
+            let _ = fs::remove_dir_all(&staging);
+            Err(e)
+        }
+    }
+}
+
+/// A staging/retired directory name: a hidden sibling of the bundle, in the same
+/// directory so the swap is a rename within one filesystem (a rename across
+/// filesystems fails, and copying would reintroduce the partial-write window).
+///
+/// The suffix is unique per call so an export never removes a directory it did not
+/// create — including a leftover from a previous crashed export, which stays put
+/// under a name that says what it is rather than being silently deleted.
+fn staging_name(dir_name: &str, role: &str) -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(".{dir_name}.patchwork-{role}-{}-{stamp}", std::process::id())
+}
+
+/// Create the staging directory, which must not already exist.
+///
+/// `create_dir`, not `create_dir_all`: it fails if the path is taken, which is what
+/// makes "an export never swaps in a directory it did not fully create" a guarantee
+/// of the filesystem rather than an argument about a pid and a nanosecond stamp
+/// being unique. Anything already sitting there would otherwise be adopted and
+/// delivered inside the bundle — and, since the caller cleans up after a failed
+/// fill, deleted if the fill then failed.
+///
+/// The destination directory is still created as needed — that is the export target
+/// the user chose, not an artefact of how the export is staged.
+fn create_staging(staging: &Path) -> Result<(), String> {
+    if let Some(dest_dir) = staging.parent() {
+        fs::create_dir_all(dest_dir)
+            .map_err(|e| format!("Failed to create export directory {dest_dir:?}: {e}"))?;
+    }
+    fs::create_dir(staging)
+        .map_err(|e| format!("Failed to create staging directory {staging:?}: {e}"))
+}
+
+/// Write every file of the tree into the staging directory.
+fn fill_staging(tree: &BundleTree, staging: &Path) -> Result<(), String> {
     for file in &tree.files {
-        let target = bundle_dir.join(&file.path);
+        let target = staging.join(&file.path);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create directory {parent:?}: {e}"))?;
@@ -106,8 +171,55 @@ pub fn write_bundle(tree: &BundleTree, dest_dir: &Path) -> Result<PathBuf, Strin
         fs::write(&target, &file.contents)
             .map_err(|e| format!("Failed to write {target:?}: {e}"))?;
     }
+    Ok(())
+}
 
-    Ok(bundle_dir)
+/// Move the completed staging directory into place, retiring any previous bundle.
+///
+/// `rename` cannot replace a non-empty directory, so an existing bundle is first
+/// renamed aside and only deleted once the new one is in place. If the swap itself
+/// fails, the retired bundle is moved back: the user keeps the export they had.
+///
+/// The restore can fail too — the fault that broke the swap may equally break it —
+/// and then the user's bundle is intact but *hidden*, under a name they have no
+/// reason to guess. That double fault gets its own error naming the retired path,
+/// because "the export failed" would be actively misleading about a bundle that
+/// still exists and is one rename away from being recovered.
+fn swap_in(
+    staging: &Path,
+    bundle_dir: &Path,
+    dir_name: &str,
+    dest_dir: &Path,
+) -> Result<(), String> {
+    let retired = bundle_dir
+        .exists()
+        .then(|| dest_dir.join(staging_name(dir_name, "previous")));
+
+    if let Some(retired) = &retired {
+        fs::rename(bundle_dir, retired).map_err(|e| {
+            format!("Failed to set aside the existing bundle at {bundle_dir:?}: {e}")
+        })?;
+    }
+
+    if let Err(e) = fs::rename(staging, bundle_dir) {
+        if let Some(retired) = &retired {
+            if let Err(restore) = fs::rename(retired, bundle_dir) {
+                return Err(format!(
+                    "Failed to move the new bundle into {bundle_dir:?} ({e}), and the \
+                     previous bundle could not be put back ({restore}). It is intact at \
+                     {retired:?} — rename that directory back to {bundle_dir:?} to recover it."
+                ));
+            }
+        }
+        return Err(format!("Failed to move the new bundle into {bundle_dir:?}: {e}"));
+    }
+
+    // The export succeeded; a leftover retired copy is untidy, not a failure, so
+    // it must not turn a written bundle into a reported error.
+    if let Some(retired) = &retired {
+        let _ = fs::remove_dir_all(retired);
+    }
+    Ok(())
 }
 
 /// Bundle Emitter command: write the compiled tree to the chosen drop location.
@@ -1063,6 +1175,302 @@ mod tests {
         assert_eq!(
             fs::read_to_string(path.join("skills/inner.md")).unwrap(),
             "nested"
+        );
+    }
+
+    /// A vendor-copy bundle nests two levels deep (`skills/<leaf>/SKILL.md`) and
+    /// carries a copy of the user's own file, so the emitter has to create the
+    /// intermediate directories and write the bytes it was handed unchanged — a
+    /// CRLF artifact or one with a byte-order mark must come out of the export
+    /// exactly as the Artifact Codec emitted it.
+    #[test]
+    fn given_vendored_artifact_paths_when_written_then_directories_are_created_and_bytes_are_exact()
+    {
+        let dest = tempfile::tempdir().unwrap();
+        let skill = "\u{feff}---\r\nname: tdd\r\ndescription: A skill.\r\n---\r\n\r\nBody.\r\n";
+        let t = tree(
+            "patchwork-demo",
+            &[
+                ("SKILL.md", "umbrella"),
+                (".claude-plugin/plugin.json", "{\n  \"name\": \"patchwork-demo\"\n}\n"),
+                ("skills/tdd/SKILL.md", skill),
+                ("agents/pr-reviewer.md", "agent"),
+            ],
+        );
+
+        let path = write_bundle(&t, dest.path()).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(path.join("skills/tdd/SKILL.md")).unwrap(),
+            skill
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("agents/pr-reviewer.md")).unwrap(),
+            "agent"
+        );
+        assert!(path.join(".claude-plugin/plugin.json").is_file());
+    }
+
+    /// A tree whose second file cannot be written: its parent directory is the
+    /// first file. Any mid-write failure takes the same branch — a full disk, a
+    /// revoked permission, a path the filesystem rejects, a dropped volume — so
+    /// this is a deterministic, OS-independent stand-in for all of them.
+    fn unwritable_tree(dir: &str) -> BundleTree {
+        tree(dir, &[("blocker", "a file, not a directory"), ("blocker/SKILL.md", "x")])
+    }
+
+    /// An export either replaces the bundle completely or leaves the previous one
+    /// alone. Vendor-copy is what makes this matter: a bundle is now N files, and
+    /// the umbrella plus the plugin marker are written last, so a bundle truncated
+    /// in the middle would be a *discoverable* plugin whose steps instruct copies
+    /// that are not on disk. Clearing the destination up front would also mean a
+    /// failed re-export destroyed a working bundle.
+    #[test]
+    fn given_a_write_that_fails_midway_when_exported_then_the_previous_bundle_is_untouched() {
+        let dest = tempfile::tempdir().unwrap();
+        let good = tree(
+            "patchwork-demo",
+            &[
+                ("skills/tdd/SKILL.md", "the vendored copy"),
+                (".claude-plugin/plugin.json", "{}"),
+                ("SKILL.md", "the umbrella"),
+            ],
+        );
+        let bundle = write_bundle(&good, dest.path()).unwrap();
+
+        let result = write_bundle(&unwritable_tree("patchwork-demo"), dest.path());
+
+        assert!(result.is_err(), "a mid-write failure must be reported");
+        assert_eq!(
+            fs::read_to_string(bundle.join("SKILL.md")).unwrap(),
+            "the umbrella",
+            "the previous bundle must survive a failed export"
+        );
+        assert_eq!(
+            fs::read_to_string(bundle.join("skills/tdd/SKILL.md")).unwrap(),
+            "the vendored copy"
+        );
+        assert!(bundle.join(".claude-plugin/plugin.json").is_file());
+        assert_eq!(
+            fs::read_dir(dest.path()).unwrap().count(),
+            1,
+            "no staging directory may be left behind: {:?}",
+            fs::read_dir(dest.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn given_a_failed_first_export_when_written_then_no_bundle_directory_appears_at_all() {
+        let dest = tempfile::tempdir().unwrap();
+
+        let result = write_bundle(&unwritable_tree("patchwork-demo"), dest.path());
+
+        assert!(result.is_err());
+        assert!(
+            !dest.path().join("patchwork-demo").exists(),
+            "a failed export must not publish a partial bundle"
+        );
+        assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
+    }
+
+    /// A staging directory that already exists must not be *adopted*: whatever is
+    /// in it would be swapped into the delivered bundle, where a stray
+    /// `skills/ghost/SKILL.md` becomes a discoverable `patchwork-demo:ghost` the
+    /// umbrella never mentions. Unreachable in practice (the name carries a pid and
+    /// a nanosecond stamp), which is the point — after this, "an export never swaps
+    /// in a directory it did not create" rests on the filesystem's `EEXIST` rather
+    /// than on those two values being unique.
+    #[test]
+    fn given_a_staging_directory_that_already_exists_when_creating_it_then_it_is_neither_adopted_nor_removed(
+    ) {
+        let dest = tempfile::tempdir().unwrap();
+        let staging = dest.path().join(".patchwork-demo.patchwork-staging-1-1");
+        write_file(staging.join("skills/ghost/SKILL.md"), "not ours");
+
+        let result = create_staging(&staging);
+
+        assert!(result.is_err(), "an occupied staging directory must be refused");
+        assert_eq!(
+            fs::read_to_string(staging.join("skills/ghost/SKILL.md")).unwrap(),
+            "not ours",
+            "what was already there is left alone: not swept into a bundle, and not \
+             deleted either — this export did not create it"
+        );
+    }
+
+    /// Read a `const NAME = <int> + <int> …;` out of the TS source and sum it.
+    ///
+    /// The point is that the numbers compared below are the *shipped* ones. A local
+    /// copy of them would let the two languages drift in the direction this test
+    /// exists to catch: the TS bound shrinking its reservation while the Rust name
+    /// keeps its length.
+    fn ts_const(source: &str, name: &str) -> usize {
+        let line = source
+            .lines()
+            .find(|l| l.contains(&format!("const {name} =")))
+            .unwrap_or_else(|| panic!("{name} must be declared in graph-document.ts"));
+        let rhs = line
+            .split_once('=')
+            .expect("a const declaration has a right-hand side")
+            .1;
+        rhs.trim()
+            .trim_end_matches(';')
+            .split('+')
+            .map(|term| {
+                term.trim()
+                    .parse::<usize>()
+                    .unwrap_or_else(|_| panic!("{name} must be a sum of integers: {rhs:?}"))
+            })
+            .sum()
+    }
+
+    /// `MAX_BUNDLE_DIR_LENGTH` in `src/domain/graph-document.ts` reserves room for
+    /// what this module's `staging_name` adds. One arithmetic, two languages, read
+    /// from the source on both sides — so either half changing alone fails here
+    /// rather than at an export.
+    #[test]
+    fn given_the_staging_name_cost_then_it_matches_the_workflow_name_bound() {
+        let ts = fs::read_to_string("../src/domain/graph-document.ts")
+            .expect("the document module must be readable");
+        let max_component = ts_const(&ts, "MAX_PATH_COMPONENT_LENGTH");
+        let reserved = ts_const(&ts, "EMITTER_NAME_COST");
+        let max_dir_name = max_component - reserved;
+
+        // `previous` is the longer of the two roles, so it is the binding case.
+        let longest = staging_name(&"d".repeat(max_dir_name), "previous");
+
+        assert!(
+            longest.len() - max_dir_name <= reserved,
+            "staging_name costs {} chars, more than the {reserved} the TS bound reserves",
+            longest.len() - max_dir_name
+        );
+        assert!(
+            longest.len() <= max_component,
+            "the longest name the emitter forms must fit a path component: {} chars",
+            longest.len()
+        );
+    }
+
+    /// The rollback contract, driven at `swap_in` directly because a *forward
+    /// rename* failure cannot be provoked through `write_bundle` (by then the
+    /// staging directory exists and the destination is free, so the rename
+    /// succeeds). A missing staging directory reproduces the same branch.
+    ///
+    /// The *double* fault — this rename failing and the restore failing too — is
+    /// deliberately not tested: it needs two independent filesystem faults with
+    /// different timing, and forcing it would mean injecting a rename seam into the
+    /// emitter purely for the test. Its handling is the error message named in
+    /// `swap_in`'s doc comment, reviewed rather than covered.
+    #[test]
+    fn given_a_swap_that_fails_when_rolled_back_then_the_previous_bundle_is_where_it_was() {
+        let dest = tempfile::tempdir().unwrap();
+        let good = tree("patchwork-demo", &[("SKILL.md", "the umbrella")]);
+        let bundle = write_bundle(&good, dest.path()).unwrap();
+
+        let result = swap_in(
+            &dest.path().join("never-staged"),
+            &bundle,
+            "patchwork-demo",
+            dest.path(),
+        );
+
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("Failed to move the new bundle into"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !error.contains("could not be put back"),
+            "the restore succeeded, so it must not be reported as a double fault: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(bundle.join("SKILL.md")).unwrap(),
+            "the umbrella",
+            "the previous bundle must be back under its own name, not left retired"
+        );
+        assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn given_a_successful_export_over_an_existing_bundle_when_written_then_it_fully_replaces_it() {
+        let dest = tempfile::tempdir().unwrap();
+        let first = tree(
+            "patchwork-demo",
+            &[("skills/old/SKILL.md", "stale copy"), ("SKILL.md", "v1")],
+        );
+        write_bundle(&first, dest.path()).unwrap();
+        let second = tree(
+            "patchwork-demo",
+            &[("skills/new/SKILL.md", "fresh copy"), ("SKILL.md", "v2")],
+        );
+
+        let bundle = write_bundle(&second, dest.path()).unwrap();
+
+        assert_eq!(fs::read_to_string(bundle.join("SKILL.md")).unwrap(), "v2");
+        assert_eq!(
+            fs::read_to_string(bundle.join("skills/new/SKILL.md")).unwrap(),
+            "fresh copy"
+        );
+        assert!(
+            !bundle.join("skills/old").exists(),
+            "a stale vendored copy from a previous export must not linger"
+        );
+        assert_eq!(
+            fs::read_dir(dest.path()).unwrap().count(),
+            1,
+            "the swap must not leave a staging or retired directory behind"
+        );
+    }
+
+    /// Copy a directory tree, so a test can drop a bundle where a user would.
+    fn copy_tree(src: &Path, dst: &Path) {
+        fs::create_dir_all(dst).unwrap();
+        for entry in fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let target = dst.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    /// The claim the umbrella's prose makes about a vendored artifact — "invoke
+    /// `patchwork-vendor-mix:tdd`" — is only true if the emitted bundle is a shape
+    /// this walk resolves those names from. So the compiler's own golden bundle is
+    /// written out by the real `write_bundle`, into a source root exactly where a
+    /// user would drop it, and scanned. This is what ADR-0002 decision 1b rests on.
+    ///
+    /// The negative control is
+    /// `given_nested_skills_without_the_plugin_marker_when_scanned_then_nothing_is_importable`:
+    /// the same shape *without* `.claude-plugin/` yields nothing at all, which is
+    /// why the compiler emits the marker whenever it vendors anything.
+    #[test]
+    fn given_an_exported_bundle_that_vendors_artifacts_when_scanned_then_its_bundled_names_resolve()
+    {
+        let golden = Path::new("../src/domain/__fixtures__/vendor-mix");
+        assert!(
+            golden.join(".claude-plugin/plugin.json").is_file(),
+            "the compiler's golden bundle must carry the plugin marker"
+        );
+        let root = tempfile::tempdir().unwrap();
+        // Dropped into the root's `skills/` the way a user installs a bundle.
+        copy_tree(golden, &root.path().join("skills/patchwork-vendor-mix"));
+
+        let report = scan_one(root.path());
+
+        assert_eq!(report.problems, Vec::<String>::new());
+        assert_eq!(
+            discovered(&report),
+            vec![
+                ("skill", "patchwork-vendor-mix"),
+                ("skill", "patchwork-vendor-mix:tdd"),
+                ("agent", "patchwork-vendor-mix:pr-reviewer"),
+            ]
         );
     }
 

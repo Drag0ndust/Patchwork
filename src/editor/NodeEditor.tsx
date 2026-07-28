@@ -1,6 +1,8 @@
 import {
   artifactKindOf,
+  exportModeOf,
   type ArtifactRefData,
+  type ExportMode,
   type InputData,
   type NodeData,
   type NodeType,
@@ -15,10 +17,21 @@ import {
 } from "../import/catalog";
 import type { PatchNode } from "../canvas/react-flow-adapter";
 
+/**
+ * A node's new data, or a function producing it from the node's *current* data.
+ *
+ * The updater form exists for edits that change one field of the data and must
+ * leave the rest alone: building a whole object from the rendered props would let
+ * two edits landing in the same tick overwrite each other with what each of them
+ * last saw. React flushes discrete events one at a time, so this is a latent
+ * hazard rather than a live bug — closed here rather than left resting on that.
+ */
+export type NodeDataEdit = NodeData | ((current: NodeData) => NodeData);
+
 interface NodeEditorProps {
   node: PatchNode | null;
   catalog: ImportCatalog;
-  onChange: (id: string, label: string, data: NodeData) => void;
+  onChange: (id: string, label: string, data: NodeDataEdit) => void;
 }
 
 const TYPE_LABEL: Record<NodeType, string> = {
@@ -41,7 +54,7 @@ export function NodeEditor({ node, catalog, onChange }: NodeEditorProps) {
   const type = node.type as NodeType;
   const { label, node: data } = node.data;
 
-  const emit = (nextLabel: string, nextData: NodeData) =>
+  const emit = (nextLabel: string, nextData: NodeDataEdit) =>
     onChange(node.id, nextLabel, nextData);
 
   return (
@@ -80,7 +93,14 @@ export function NodeEditor({ node, catalog, onChange }: NodeEditorProps) {
           kind={artifactKindOf(type) as ArtifactKind}
           data={data as ArtifactRefData}
           catalog={catalog}
-          onChange={(d) => emit(label, d)}
+          onChange={(d) =>
+            emit(
+              label,
+              typeof d === "function"
+                ? (current) => d(current as ArtifactRefData)
+                : d,
+            )
+          }
         />
       )}
     </div>
@@ -94,6 +114,11 @@ export function NodeEditor({ node, catalog, onChange }: NodeEditorProps) {
  * — never a path — so the reference is re-resolved on every open. A reference to
  * an artifact that is no longer present stays selectable and visible, flagged
  * unresolved, rather than being silently reset.
+ *
+ * Alongside the binding sits the per-node export choice: reference the artifact
+ * by name, or copy it into the bundle. It is edited and stored independently of
+ * *which* artifact is bound, so re-picking one never quietly changes what the
+ * export does with it.
  */
 function ArtifactPicker({
   kind,
@@ -104,11 +129,12 @@ function ArtifactPicker({
   kind: ArtifactKind;
   data: ArtifactRefData;
   catalog: ImportCatalog;
-  onChange: (data: ArtifactRefData) => void;
+  onChange: (data: ArtifactRefData | ((current: ArtifactRefData) => ArtifactRefData)) => void;
 }) {
   const options = catalogArtifactsOfKind(catalog, kind);
   const bound = data.name === "" ? undefined : findCatalogArtifact(catalog, kind, data.name);
   const noun = kind === "skill" ? "skill" : "agent";
+  const exportMode = exportModeOf(data);
 
   return (
     <>
@@ -117,15 +143,23 @@ function ArtifactPicker({
         <select
           value={data.name}
           onChange={(e) => {
+            // Updates, not rebuilds — symmetrical with the export-mode select
+            // below: this control owns the binding and must leave every other
+            // field of the node's data exactly as it currently is.
+            //
             // The placeholder unbinds: without this the select would snap back
             // and a bound (or unresolved) node could never be re-picked.
             if (e.target.value === "") {
-              onChange({ name: "", rootId: "" });
+              onChange((current) => ({ ...current, name: "", rootId: "" }));
               return;
             }
             const picked = findCatalogArtifact(catalog, kind, e.target.value);
             if (!picked) return;
-            onChange({ name: picked.name, rootId: picked.rootId });
+            onChange((current) => ({
+              ...current,
+              name: picked.name,
+              rootId: picked.rootId,
+            }));
           }}
         >
           <option value="">Pick an imported {noun}…</option>
@@ -137,6 +171,23 @@ function ArtifactPicker({
               {option.name}
             </option>
           ))}
+        </select>
+      </label>
+      <label className="pw-field">
+        <span>On export</span>
+        <select
+          value={exportMode}
+          onChange={(e) => {
+            // An update, not a rebuild: the mode is independent of the binding, so
+            // it must not carry a copy of the binding along with it.
+            const mode = e.target.value as ExportMode;
+            onChange((current) => ({ ...current, exportMode: mode }));
+          }}
+        >
+          {/* Each option states its consequence: the choice is about whether the
+              exported bundle carries this artifact or expects to find it. */}
+          <option value="reference">Reference by name — must be installed</option>
+          <option value="vendor">Copy into the bundle — runs anywhere</option>
         </select>
       </label>
       <div className="pw-field pw-field--grow">

@@ -144,3 +144,79 @@ describe("compiling a document bound to catalogued plugin artifacts", () => {
     expect(tree.files[0].contents).not.toContain("Red-green-refactor.");
   });
 });
+
+describe("vendor-copying catalogued plugin artifacts into the bundle", () => {
+  const catalog = buildCatalog([PERSONAL], pluginScanReport());
+  const artifacts = catalog.artifacts.map((a) => a.artifact);
+
+  /** Both `implementer` agents vendored: distinct artifacts, one leaf name. */
+  function collidingLeavesDocument(): PatchworkDocument {
+    const doc = documentBoundTo("coding:tdd", "coding:implementer");
+    doc.nodes[1].data = {
+      name: "coding:tdd",
+      rootId: PERSONAL.id,
+      exportMode: "vendor",
+    };
+    doc.nodes[2].data = {
+      name: "coding:implementer",
+      rootId: PERSONAL.id,
+      exportMode: "vendor",
+    };
+    doc.nodes.splice(3, 0, {
+      id: "n3b",
+      type: "agent",
+      label: "Swift implementer",
+      data: {
+        name: "swift:implementer",
+        rootId: PERSONAL.id,
+        exportMode: "vendor",
+      },
+    });
+    doc.edges = [
+      { id: "e1", source: "n1", target: "n2" },
+      { id: "e2", source: "n2", target: "n3" },
+      { id: "e3", source: "n3", target: "n3b" },
+      { id: "e4", source: "n3b", target: "n4" },
+    ];
+    return doc;
+  }
+
+  it("given_vendorModeNodesBoundToCatalogArtifacts_whenCompiled_thenTheCatalogBytesLandInTheBundle", () => {
+    const tree = compile(collidingLeavesDocument(), artifacts);
+
+    expect(tree.files.map((f) => f.path)).toEqual([
+      "skills/tdd/SKILL.md",
+      "agents/implementer.md",
+      "agents/swift-implementer.md",
+      ".claude-plugin/plugin.json",
+      "SKILL.md",
+    ]);
+    expect(
+      tree.files.find((f) => f.path === "skills/tdd/SKILL.md")?.contents,
+    ).toContain("Red-green-refactor.");
+    expect(
+      tree.files.find((f) => f.path === "agents/swift-implementer.md")?.contents,
+    ).toContain("Implements in Swift.");
+  });
+
+  it("given_twoVendoredArtifactsSharingALeaf_whenCompiled_thenTheUmbrellaInvokesEachByItsOwnBundledName", () => {
+    // The whole seam in one assertion: the plugin namespace that made these two
+    // artifacts distinct on disk is gone inside the bundle, so the copies must
+    // have been given distinct names of their own.
+    const umbrella = compile(collidingLeavesDocument(), artifacts).files.find(
+      (f) => f.path === "SKILL.md",
+    )?.contents;
+
+    expect(umbrella).toContain(
+      "2. Delegate to the `patchwork-review-change:implementer` subagent with the Task tool",
+    );
+    expect(umbrella).toContain(
+      "3. Delegate to the `patchwork-review-change:swift-implementer` subagent with the Task tool",
+    );
+    expect(umbrella).not.toContain("## Requirements");
+  });
+
+  it("given_aVendoredArtifact_whenValidatedAndCompiled_thenTheDocumentIsStillAValidGraph", () => {
+    expect(validateGraph(collidingLeavesDocument())).toEqual({ ok: true });
+  });
+});
