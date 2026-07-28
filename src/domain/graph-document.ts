@@ -399,6 +399,16 @@ export function deserialize(json: string): PatchworkDocument {
  * upgrades a document by exactly one version, so a v1 file walks the whole
  * chain to the current version. Old files must keep opening — a migration may
  * never throw away data it does not understand.
+ *
+ * **Shape validation runs before migration**, against the *current* `NODE_TYPES`
+ * and per-type `data` contracts. That holds only while every supported version's
+ * node shapes are also valid under today's contracts — true for v1 -> v2, which
+ * added node types without changing a field. The first migration that *renames or
+ * retypes* a node's `data`, or retires a node type, would therefore see its input
+ * rejected by validation before it could ever run: adding such a step means
+ * moving `assertNodeShape`/`assertEdgeShape` after `migrateToCurrent` (and
+ * hardening the migrations themselves against malformed input, which validation
+ * currently spares them).
  */
 const MIGRATIONS: Record<number, (doc: PatchworkDocument) => PatchworkDocument> = {
   // v1 -> v2: `skill`/`agent` nodes were added to the palette. No existing

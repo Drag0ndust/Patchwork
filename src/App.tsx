@@ -35,10 +35,12 @@ import {
 import { scanSourceRoots } from "./import/scanner";
 import {
   addSourceRoot,
+  classifyAddSourceRoot,
+  MAX_SOURCE_ROOTS,
   parseSourceRoots,
   removeSourceRoot,
   serializeSourceRoots,
-  sourceRootId,
+  type AddRootOutcome,
   type SourceRoot,
 } from "./import/source-roots";
 import { NodeEditor } from "./editor/NodeEditor";
@@ -97,6 +99,31 @@ function readStoredSourceRoots(): string | null {
 /** Read the persisted root configuration; falls back to `~/.claude`. */
 function loadSourceRoots(): SourceRoot[] {
   return parseSourceRoots(readStoredSourceRoots());
+}
+
+/**
+ * What to tell the user about an attempted add.
+ *
+ * Every outcome gets a word, and the three no-ops say different things: a
+ * refused root must never read as an accepted one, and "remove one first" would
+ * be wrong advice for a root that is already configured.
+ *
+ * On the happy path the rescan the add triggers replaces this line within
+ * milliseconds with its import summary — so it announces the scan rather than
+ * looking like a confirmation that got cut off. The no-op cases trigger no
+ * rescan, which is exactly when their explanation has to persist.
+ */
+function addRootStatus(outcome: AddRootOutcome, role: RootRole, path: string): string {
+  switch (outcome) {
+    case "added":
+      return `Added ${role} source root '${path}' — scanning…`;
+    case "duplicate":
+      return `'${path}' is already a configured ${role} source root.`;
+    case "at-capacity":
+      return `Cannot add '${path}': at the limit of ${MAX_SOURCE_ROOTS} source roots. Remove one first.`;
+    case "empty-path":
+      return "Could not add source root: the chosen path is empty.";
+  }
 }
 
 function persistSourceRoots(roots: SourceRoot[]): void {
@@ -222,17 +249,12 @@ export function App() {
         // changed while it was open. Adding to a captured list would silently
         // resurrect a root the user removed in the meantime.
         setSourceRoots((prev) => addSourceRoot(prev, path, role));
-        // Re-picking a configured root is a no-op; say so rather than leaving the
-        // user with a rescan as the only visible effect. `rootsRef` is the
-        // configuration as of the last render — the same list the updater above
-        // starts from.
-        const alreadyConfigured = rootsRef.current.some(
-          (r) => r.id === sourceRootId(role, path),
-        );
+        // Every add needs a word, and the three ways an add can do nothing are
+        // not interchangeable — a refused root must not read as an accepted one.
+        // `rootsRef` is the configuration as of the last render, the same list
+        // the updater above starts from.
         setStatus(
-          alreadyConfigured
-            ? `'${path}' is already a configured ${role} source root.`
-            : `Added ${role} source root '${path}'.`,
+          addRootStatus(classifyAddSourceRoot(rootsRef.current, path, role), role, path),
         );
       } catch (e) {
         setStatus(`Could not add source root: ${String(e)}`);

@@ -62,25 +62,51 @@ export function sourceRootId(role: RootRole, path: string): string {
 }
 
 /**
+ * Why an add did or did not change the configuration.
+ *
+ * The three no-op cases are **not** interchangeable to a user: a duplicate means
+ * the root is already there, at-capacity means their root was refused, and an
+ * empty path means the picker gave nothing. `addSourceRoot` is identity-stable
+ * for all three, so a caller cannot tell them apart from the returned array —
+ * which is how a refused add came to report success.
+ */
+export type AddRootOutcome = "added" | "duplicate" | "at-capacity" | "empty-path";
+
+/**
+ * Classify what `addSourceRoot` will do with these arguments, so the rules live
+ * in exactly one place and a caller's message cannot drift from the behaviour.
+ */
+export function classifyAddSourceRoot(
+  roots: readonly SourceRoot[],
+  path: string,
+  role: RootRole,
+): AddRootOutcome {
+  const normalized = normalizeRootPath(path);
+  if (normalized === "") return "empty-path";
+  if (roots.some((r) => r.id === sourceRootId(role, normalized))) return "duplicate";
+  if (roots.length >= MAX_SOURCE_ROOTS) return "at-capacity";
+  return "added";
+}
+
+/**
  * Add a root, ignoring an exact duplicate. Order is meaningful: the Root
  * Resolver breaks same-role ties by which root was configured first.
  *
  * Never mutates, and returns the **same array** when nothing changes, so a
  * no-op add cannot pass as a state change and trigger a needless rescan (which
- * would also wipe the status line explaining that nothing changed).
+ * would also wipe the status line explaining that nothing changed). Callers that
+ * need to *report* what happened must ask [`classifyAddSourceRoot`] — the array
+ * alone cannot distinguish a duplicate from a refusal.
  */
 export function addSourceRoot(
   roots: readonly SourceRoot[],
   path: string,
   role: RootRole,
 ): SourceRoot[] {
-  const normalized = normalizeRootPath(path);
   const unchanged = roots as SourceRoot[];
-  if (normalized === "") return unchanged;
-  const id = sourceRootId(role, normalized);
-  if (roots.some((r) => r.id === id)) return unchanged;
-  if (roots.length >= MAX_SOURCE_ROOTS) return unchanged;
-  return [...roots, { id, path: normalized, role }];
+  if (classifyAddSourceRoot(roots, path, role) !== "added") return unchanged;
+  const normalized = normalizeRootPath(path);
+  return [...roots, { id: sourceRootId(role, normalized), path: normalized, role }];
 }
 
 /** Remove a root; identity-stable when `id` is not configured. */

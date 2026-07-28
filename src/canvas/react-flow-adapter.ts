@@ -69,7 +69,11 @@ export function applyResolution(
     // re-runs against the roots configured *now*, so the winning root may
     // legitimately differ. Matching on rootId would defeat that contract.
     const { name } = node.data.node as ArtifactRefData;
-    const unresolved = !findCatalogArtifact(catalog, kind, name);
+    // An unbound node references nothing yet, so it cannot be *un*resolved — the
+    // node body already says "no artifact bound". Flagging it here would also add
+    // it to App's "reference an artifact that is not in any configured source
+    // root" notice, which would be claiming a reference that does not exist.
+    const unresolved = name !== "" && !findCatalogArtifact(catalog, kind, name);
     if (node.data.unresolved === unresolved) return node;
     changed = true;
     return { ...node, data: { ...node.data, unresolved } };

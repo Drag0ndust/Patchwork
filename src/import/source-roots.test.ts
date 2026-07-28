@@ -3,6 +3,9 @@ import {
   DEFAULT_SOURCE_ROOTS,
   MAX_SOURCE_ROOTS,
   addSourceRoot,
+  classifyAddSourceRoot,
+  type AddRootOutcome,
+  type SourceRoot,
   parseSourceRoots,
   removeSourceRoot,
   serializeSourceRoots,
@@ -66,6 +69,72 @@ describe("addSourceRoot", () => {
 
     expect(roots).toHaveLength(1);
   });
+});
+
+describe("classifyAddSourceRoot — the three no-ops are distinguishable", () => {
+  /** A full configuration, so the next add can only be refused for capacity. */
+  function fullRoots() {
+    let roots: SourceRoot[] = [];
+    for (let i = 0; i < MAX_SOURCE_ROOTS; i += 1) {
+      roots = addSourceRoot(roots, `/work/${i}/.claude`, "project");
+    }
+    return roots;
+  }
+
+  it("given_newPath_whenClassified_thenAdded", () => {
+    expect(
+      classifyAddSourceRoot(DEFAULT_SOURCE_ROOTS, "/work/.claude", "project"),
+    ).toBe("added");
+  });
+
+  it("given_configuredPath_whenClassified_thenDuplicate", () => {
+    expect(classifyAddSourceRoot(DEFAULT_SOURCE_ROOTS, "~/.claude/", "personal")).toBe(
+      "duplicate",
+    );
+  });
+
+  it("given_fullConfiguration_whenClassified_thenAtCapacityRatherThanAdded", () => {
+    // The bug this exists for: a refused root reported as "Added …" because the
+    // caller could only see an unchanged array, which a duplicate also produces.
+    const roots = fullRoots();
+
+    expect(roots).toHaveLength(MAX_SOURCE_ROOTS);
+    expect(classifyAddSourceRoot(roots, "/work/extra/.claude", "project")).toBe(
+      "at-capacity",
+    );
+    expect(addSourceRoot(roots, "/work/extra/.claude", "project")).toBe(roots);
+  });
+
+  it("given_fullConfigurationAndAConfiguredPath_whenClassified_thenDuplicateWins", () => {
+    // Capacity is irrelevant when the root is already there: telling the user to
+    // remove one first would be wrong advice.
+    const roots = fullRoots();
+
+    expect(classifyAddSourceRoot(roots, "/work/0/.claude", "project")).toBe("duplicate");
+  });
+
+  it("given_blankPath_whenClassified_thenEmptyPath", () => {
+    expect(classifyAddSourceRoot(DEFAULT_SOURCE_ROOTS, "   ", "project")).toBe(
+      "empty-path",
+    );
+  });
+
+  it.each(["added", "duplicate", "at-capacity", "empty-path"] as const)(
+    "given_%sOutcome_whenAdding_thenTheArrayAgreesWithTheClassification",
+    (outcome) => {
+      const cases: Record<AddRootOutcome, [readonly SourceRoot[], string]> = {
+        added: [DEFAULT_SOURCE_ROOTS, "/work/.claude"],
+        duplicate: [DEFAULT_SOURCE_ROOTS, "~/.claude"],
+        "at-capacity": [fullRoots(), "/work/extra/.claude"],
+        "empty-path": [DEFAULT_SOURCE_ROOTS, ""],
+      };
+      const [roots, path] = cases[outcome];
+
+      const added = addSourceRoot(roots, path, outcome === "duplicate" ? "personal" : "project");
+
+      expect(added === roots).toBe(outcome !== "added");
+    },
+  );
 });
 
 describe("removeSourceRoot", () => {

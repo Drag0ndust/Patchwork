@@ -8,6 +8,7 @@ import { StrictMode } from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ScanReport } from "./import/catalog";
+import { MAX_SOURCE_ROOTS } from "./import/source-roots";
 
 const bridge = vi.hoisted(() => ({
   scanRoots: vi.fn<(roots: Array<{ id: string; path: string }>) => Promise<ScanReport>>(),
@@ -123,6 +124,28 @@ describe("opening a document while the initial scan is in flight", () => {
     scan.resolve(reportWith([["skill", "tdd"]]));
 
     await waitFor(() => expect(screen.queryByText(UNRESOLVED_NOTICE)).toBeNull());
+  });
+});
+
+describe("a Skill/Agent node with nothing bound yet", () => {
+  it("given_unboundRefNodesOnTheCanvas_whenAScanResolvesOverThem_thenNoUnresolvedNoticeIsShown", async () => {
+    // These nodes reference nothing, so claiming they "reference an artifact that
+    // is not in any configured source root" is a claim about a reference that does
+    // not exist — and it contradicts the dock's own "No skill bound yet".
+    //
+    // The nodes are placed *before* a scan lands on them, because that is when
+    // resolution re-runs: adding a root is the shortest reachable trigger.
+    bridge.scanRoots.mockResolvedValue(reportWith([["skill", "tdd"]]));
+    bridge.pickSourceRoot.mockResolvedValue("/work/app/.claude");
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/from 1 source root/)).toBeTruthy());
+    fireEvent.click(screen.getByText("＋ Skill"));
+    fireEvent.click(screen.getByText("＋ Agent"));
+    fireEvent.click(screen.getByText("＋ Project root…"));
+
+    await waitFor(() => expect(screen.getByText(/from 2 source root/)).toBeTruthy());
+    expect(screen.queryByText(UNRESOLVED_NOTICE)).toBeNull();
   });
 });
 
@@ -296,6 +319,56 @@ describe("changing the roots while the add-root picker is open", () => {
     );
     // A no-op add must not trigger another scan either.
     expect(bridge.scanRoots).toHaveBeenCalledTimes(1);
+  });
+
+  it("given_aRootPickedWhenTheConfigurationIsFull_whenItResolves_thenTheRefusalIsReportedNotSuccess", async () => {
+    // The refusal used to be reported as `Added project source root '…'` — and
+    // because a refused add is identity-stable, no rescan followed to overwrite
+    // it, so the false message was the one that stayed on screen.
+    const full = JSON.stringify(
+      Array.from({ length: MAX_SOURCE_ROOTS }, (_unused, i) => ({
+        id: `project:/work/${i}/.claude`,
+        path: `/work/${i}/.claude`,
+        role: "project",
+      })),
+    );
+    vi.stubGlobal("localStorage", {
+      getItem: () => full,
+      setItem: () => {},
+      removeItem: () => {},
+    });
+    bridge.scanRoots.mockResolvedValue({ artifacts: [], problems: [] });
+    bridge.pickSourceRoot.mockResolvedValue("/work/extra/.claude");
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/Imported 0 skill/)).toBeTruthy());
+    fireEvent.click(screen.getByText("＋ Project root…"));
+
+    await waitFor(() =>
+      expect(document.querySelector(".pw-status")?.textContent).toMatch(
+        new RegExp(`at the limit of ${MAX_SOURCE_ROOTS} source roots`),
+      ),
+    );
+    expect(document.querySelector(".pw-status")?.textContent).not.toMatch(/^Added /);
+    expect(bridge.scanRoots).toHaveBeenCalledTimes(1);
+  });
+
+  it("given_aRootPickedThatIsNew_whenItResolves_thenTheSuccessSaysAScanIsComing", async () => {
+    bridge.scanRoots.mockResolvedValue({ artifacts: [], problems: [] });
+    bridge.pickSourceRoot.mockResolvedValue("/work/app/.claude");
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/Imported 0 skill/)).toBeTruthy());
+    fireEvent.click(screen.getByText("＋ Project root…"));
+
+    // The rescan replaces this line within milliseconds, so it has to read as
+    // handing off rather than as a confirmation that got cut off.
+    await waitFor(() =>
+      expect(document.querySelector(".pw-status")?.textContent).toMatch(
+        /Added project source root '\/work\/app\/\.claude' — scanning…/,
+      ),
+    );
+    await waitFor(() => expect(bridge.scanRoots).toHaveBeenCalledTimes(2));
   });
 
   it("given_aRootRemovedWhileThePickerIsPending_whenItResolves_thenTheRemovalIsNotUndone", () => {

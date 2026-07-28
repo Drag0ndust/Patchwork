@@ -9,6 +9,7 @@
  */
 
 import { stringify as stringifyYaml } from "yaml";
+import { isValidArtifactName } from "./artifact-codec";
 import { artifactKindOf } from "./graph-document";
 import type {
   ArtifactRefData,
@@ -89,6 +90,24 @@ function codeSpanText(value: string | undefined): string {
   return (value ?? "").replace(/\s+/g, " ").trim();
 }
 
+/**
+ * Render an artifact name inside an inline code span.
+ *
+ * `validateGraph` constrains names to [`isValidArtifactName`], and `handleExport`
+ * validates before compiling — but the umbrella emitter is the boundary against
+ * *hand-edited* documents, where `assertNodeShape` only requires `data.name` to
+ * be a string. A backtick would then close the span early and let the rest of the
+ * name escape into prose, corrupting a document the user cannot see the source of.
+ *
+ * An invalid name is emitted with its backticks stripped rather than dropped: the
+ * reference stays visibly wrong (and is flagged unresolved on the canvas) instead
+ * of quietly deforming the surrounding Markdown.
+ */
+function artifactSpanText(value: string | undefined): string {
+  const text = codeSpanText(value);
+  return isValidArtifactName(text) ? text : text.replace(/`/g, "");
+}
+
 function sanitizeInline(value: string | undefined): string {
   const collapsed = (value ?? "").replace(/\s*[\r\n]+\s*/g, " ").trim();
 
@@ -147,9 +166,9 @@ function linearOrder(doc: PatchworkDocument): GraphNode[] {
 function stepInstruction(node: GraphNode): string {
   switch (node.type) {
     case "skill":
-      return `Invoke the \`${codeSpanText((node.data as ArtifactRefData).name)}\` skill with the Skill tool, then use its result in the next step.`;
+      return `Invoke the \`${artifactSpanText((node.data as ArtifactRefData).name)}\` skill with the Skill tool, then use its result in the next step.`;
     case "agent":
-      return `Delegate to the \`${codeSpanText((node.data as ArtifactRefData).name)}\` subagent with the Task tool, then use its result in the next step.`;
+      return `Delegate to the \`${artifactSpanText((node.data as ArtifactRefData).name)}\` subagent with the Task tool, then use its result in the next step.`;
     default:
       return sanitizeInline((node.data as PromptData | undefined)?.instruction);
   }
@@ -224,7 +243,7 @@ function renderSkill(doc: PatchworkDocument, ordered: GraphNode[]): string {
     );
     lines.push("");
     for (const node of references) {
-      const name = codeSpanText((node.data as ArtifactRefData).name);
+      const name = artifactSpanText((node.data as ArtifactRefData).name);
       lines.push(`- ${node.type === "skill" ? "skill" : "subagent"} \`${name}\``);
     }
     lines.push("");

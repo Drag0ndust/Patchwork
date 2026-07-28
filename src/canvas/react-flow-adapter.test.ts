@@ -148,4 +148,44 @@ describe("applyResolution", () => {
 
     expect(applyResolution(nodes, catalogWith([]))).not.toBe(nodes);
   });
+
+  it("given_unboundRefNodeFromTheToolbar_whenResolved_thenItIsNotFlaggedUnresolved", () => {
+    // A node with no artifact bound references nothing, so it must not read as a
+    // broken reference — on the node body, or in App's unresolved-count notice.
+    const nodes = unboundFlow().nodes;
+
+    const resolved = applyResolution(nodes, catalogWith([["skill", "tdd"]]));
+
+    expect(resolved.map((n) => n.data.unresolved)).toEqual([false, false]);
+  });
+
+  it("given_unboundRefNodes_whenResolvedAgainstAnEmptyCatalog_thenNoneAreFlagged", () => {
+    const resolved = applyResolution(unboundFlow().nodes, catalogWith([]));
+
+    expect(resolved.some((n) => n.data.unresolved)).toBe(false);
+  });
+
+  it("given_unboundRefNode_whenBoundToAnAbsentArtifact_thenItBecomesUnresolved", () => {
+    const bound = unboundFlow().nodes.map((n) => ({
+      ...n,
+      data: { ...n.data, node: { name: "gone", rootId: "" } },
+    }));
+
+    const resolved = applyResolution(bound, catalogWith([]));
+
+    expect(resolved.map((n) => n.data.unresolved)).toEqual([true, true]);
+  });
 });
+
+/** A canvas holding freshly-added skill/agent nodes, with no artifact bound yet. */
+function unboundFlow() {
+  return documentToFlow({
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    workflow: { name: "Unbound", description: "d" },
+    nodes: [
+      { id: "n1", type: "skill", label: "Skill", data: { name: "", rootId: "" } },
+      { id: "n2", type: "agent", label: "Agent", data: { name: "", rootId: "" } },
+    ],
+    edges: [],
+  });
+}
