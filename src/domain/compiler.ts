@@ -66,30 +66,6 @@ function isAsciiPunctuation(ch: string): boolean {
 }
 
 /**
- * Sanitize a single untrusted field value before it is rendered into the
- * Markdown body. This is the one place that routes untrusted content safely,
- * and it is LOSSLESS for prose — it never rewrites the user's characters.
- *
- * Rather than enumerate block markers (which is whack-a-mole — `#`, `~~~`,
- * `<h1>`, `___`, `|`, ...), it closes the whole class generally: every
- * Markdown/HTML block construct is triggered by the LEADING character(s) at
- * column 0, so neutralizing only the leading character neutralizes all of them.
- *
- * 1. Collapse newlines/whitespace to a single line (no multi-line block can
- *    form), and trim.
- * 2. Backslash-escape the leading character if it is any ASCII punctuation.
- *    This defuses every block-starter — including a leading fence run like
- *    `~~~` or ` ``` ` (the line no longer starts with the fence) — while the
- *    escaped character still renders as its literal self.
- * 3. Ordered lists start with digits (not punctuation) then `.`/`)`, so escape
- *    that delimiter as the one non-punctuation-led case.
- *
- * Characters after the first are left untouched, so `~/notes` and inline code
- * like `` `npm build` `` survive verbatim. Backticks in a *parameter name*
- * (the one code-span context) are handled at the source: `validateGraph`
- * constrains parameter names to a safe charset.
- */
-/**
  * Render an untrusted value inside an inline code span. A code span cannot
  * start a block, so it needs NO leading-marker escaping — and backslash escapes
  * do not work inside code spans (CommonMark §6.1), so applying the prose
@@ -119,8 +95,57 @@ function artifactSpanText(value: string | undefined): string {
   return isValidArtifactName(text) ? text : text.replace(/`/g, "");
 }
 
+/**
+ * Collapse each whitespace run that contains a line break to one space, and leave
+ * every other whitespace run alone.
+ *
+ * Matching the *whole* run with a single character class and deciding inside the
+ * replacer is what keeps this linear. The obvious spelling — a `\s` run, then a
+ * `[\r\n]` run, then a `\s` run — is ambiguous, because a line break can be
+ * matched by either of the three. On a whitespace run with no line break in it
+ * the engine consumed the run, failed, and gave a character back once per
+ * position, which is quadratic: a 200,000-character run of spaces took 63
+ * seconds, and `compile` runs on the renderer's main thread, so that was a frozen
+ * window one paste away.
+ *
+ * `\s+` cannot fail after its first character and has nothing following it to
+ * backtrack for, so each character is visited once.
+ */
+function collapseLineBreakRuns(value: string): string {
+  return value.replace(/\s+/g, (run) =>
+    run.includes("\n") || run.includes("\r") ? " " : run,
+  );
+}
+
+/**
+ * Sanitize a single untrusted field value before it is rendered into the
+ * Markdown body. This is the one place that routes untrusted content safely,
+ * and it is LOSSLESS for prose — it never rewrites the user's characters.
+ *
+ * Rather than enumerate block markers (which is whack-a-mole — `#`, `~~~`,
+ * `<h1>`, `___`, `|`, ...), it closes the whole class generally: every
+ * Markdown/HTML block construct is triggered by the LEADING character(s) at
+ * column 0, so neutralizing only the leading character neutralizes all of them.
+ *
+ * 1. Collapse every whitespace run that contains a line break to a single space
+ *    (no multi-line block can form), and trim. A run *without* a line break is
+ *    left exactly as the user typed it — that is what "lossless for prose"
+ *    means here, and it is why this cannot simply collapse `\s+` the way
+ *    [`codeSpanText`] does.
+ * 2. Backslash-escape the leading character if it is any ASCII punctuation.
+ *    This defuses every block-starter — including a leading fence run like
+ *    `~~~` or ` ``` ` (the line no longer starts with the fence) — while the
+ *    escaped character still renders as its literal self.
+ * 3. Ordered lists start with digits (not punctuation) then `.`/`)`, so escape
+ *    that delimiter as the one non-punctuation-led case.
+ *
+ * Characters after the first are left untouched, so `~/notes` and inline code
+ * like `` `npm build` `` survive verbatim. Backticks in a *parameter name*
+ * (the one code-span context) are handled at the source: `validateGraph`
+ * constrains parameter names to a safe charset.
+ */
 function sanitizeInline(value: string | undefined): string {
-  const collapsed = (value ?? "").replace(/\s*[\r\n]+\s*/g, " ").trim();
+  const collapsed = collapseLineBreakRuns(value ?? "").trim();
 
   if (collapsed.length === 0) return collapsed;
 
@@ -164,6 +189,23 @@ function linearOrder(doc: PatchworkDocument): GraphNode[] {
     if (!seen.has(node.id)) ordered.push(node);
   }
   return ordered;
+}
+
+/**
+ * Drop the trailing newline(s) a YAML emitter ends its document with.
+ *
+ * A loop rather than `/\n+$/`, for the same reason as [`collapseLineBreakRuns`]:
+ * anchoring a greedy run at the end of the string makes the engine match a run of
+ * newlines *anywhere* and then backtrack the whole way once `$` fails, which is
+ * quadratic in the newlines the emitted block scalar contains. A description with
+ * 200,000 of them took 57 seconds to strip one character — on the renderer's main
+ * thread. `trimEnd` is not a substitute: it would also eat trailing spaces and tabs,
+ * which are part of the emitted YAML.
+ */
+function stripTrailingNewlines(text: string): string {
+  let end = text.length;
+  while (end > 0 && text[end - 1] === "\n") end -= 1;
+  return text.slice(0, end);
 }
 
 /** The identity of an artifact reference: its kind and the name it was bound to. */
@@ -485,11 +527,19 @@ function renderSkill(
   // Serialize frontmatter through a real YAML emitter so descriptions with
   // colons, leading indicators, quotes, or newlines stay valid YAML.
   // `lineWidth: 0` disables line folding so long scalars are not wrapped.
-  const frontmatter = stringifyYaml(
-    { name: slug, description },
-    { lineWidth: 0 },
-  ).replace(/\n+$/, "");
-  lines.push("---", ...frontmatter.split("\n"), "---");
+  const frontmatter = stripTrailingNewlines(
+    stringifyYaml({ name: slug, description }, { lineWidth: 0 }),
+  );
+  // Appended one line at a time, NOT spread into `push`: a description with many
+  // newlines becomes a block scalar of as many lines, and `push(...lines)` passes
+  // each one as an argument — 120,000 of them overflowed the argument stack and the
+  // export failed with `RangeError: Maximum call stack size exceeded`. The line
+  // count is what breaks it, not the size, so bounding the field would not have.
+  lines.push("---");
+  for (const line of frontmatter.split("\n")) {
+    lines.push(line);
+  }
+  lines.push("---");
   lines.push("");
   lines.push(`# ${sanitizeInline(doc.workflow.name) || "Workflow"}`);
   lines.push("");

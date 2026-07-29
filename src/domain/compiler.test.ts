@@ -313,6 +313,93 @@ describe("compile", () => {
   });
 });
 
+/**
+ * The one line of the umbrella that carries the Output node's description — the
+ * shortest route to `sanitizeInline`'s exact output, character for character.
+ */
+function compiledOutputLine(description: string): string {
+  const doc = canonicalLinearDocument();
+  const output = doc.nodes.find((n) => n.type === "output");
+  if (!output) throw new Error("the canonical document has an output node");
+  output.data = { description };
+  const lines = compile(doc).files[0].contents.split("\n");
+  const marker = lines.indexOf("Return the following as the final result:");
+  return lines[marker + 2];
+}
+
+describe("inline sanitization", () => {
+  // Character-level, not "contains": the collapse is documented as lossless for
+  // prose, so the interesting property is what it leaves ALONE — a run of spaces
+  // or tabs with no line break in it is the user's own formatting.
+  it.each([
+    ["a lone space", "one two", "one two"],
+    ["a run of spaces", "one   two", "one   two"],
+    ["a run of tabs", "one\t\ttwo", "one\t\ttwo"],
+    ["a bare newline", "one\ntwo", "one two"],
+    ["a CRLF", "one\r\ntwo", "one two"],
+    ["a blank line", "one\n\n\ntwo", "one two"],
+    ["spaces around a newline", "one  \n  two", "one two"],
+    ["tabs and CR around a newline", "one \t\r\n\t two", "one two"],
+    ["a newline run beside a space run", "one \n two   three", "one two   three"],
+    ["surrounding whitespace", "  \n one two \n  ", "one two"],
+    ["leading punctuation", "- one two", "\\- one two"],
+    ["leading punctuation after a newline", "\n\n- one two", "\\- one two"],
+    ["an ordered-list marker", "12) one two", "12\\) one two"],
+  ])(
+    "given_fieldWith_%s_whenCompiling_thenTheLineIsExactlyTheCollapsedText",
+    (_name, description, expected) => {
+      expect(compiledOutputLine(description)).toBe(expected);
+    },
+  );
+
+  // A description with many lines makes the YAML emitter produce a block scalar of
+  // one line per input line, and spreading those into `Array.prototype.push` blew
+  // the argument stack: 120,000 newlines threw `RangeError: Maximum call stack size
+  // exceeded`, surfacing to the user as `Export failed: RangeError…`. It is the line
+  // *count* that does it, not the size — a 4 MB single-line description is fine.
+  // Only reachable through a hand-edited `.patchwork`, which is exactly the input
+  // this path is supposed to survive.
+  it("given_aDescriptionWithMoreLinesThanTheArgumentStackHolds_whenCompiling_thenItStillCompiles", () => {
+    const description = `start${"\n".repeat(200_000)}end`;
+    const started = performance.now();
+
+    const skill = compile(documentWithDescription(description)).files[0].contents;
+
+    // The same input also found a second quadratic step behind the frontmatter:
+    // stripping the emitter's trailing newline with an end-anchored `/\n+$/` took 57
+    // seconds on this description. Budget as loose as the collapse tests below.
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(parseFrontmatter(skill).description).toBe(description);
+    // The body's own structure is intact: the newlines collapsed to one space.
+    expect(skill).toContain("\nstart end\n");
+    expect(skill.match(/^## /gm)).toHaveLength(3);
+  });
+
+  // `compile` runs on the renderer's main thread, so a super-linear collapse is a
+  // frozen UI, reachable by pasting into any prose field. The old
+  // `/\s*[\r\n]+\s*/` was ambiguous (a newline could match either branch) and
+  // backtracked catastrophically: 4x the cost for 2x the input, 63 seconds for the
+  // run below. The budget is deliberately loose — it is there to catch a return to
+  // quadratic, not to police milliseconds.
+  it.each([
+    ["line breaks", " \n".repeat(100_000)],
+    ["spaces and tabs only", " \t".repeat(100_000)],
+    ["every kind of whitespace", " \t\r\n".repeat(50_000)],
+  ])(
+    "given_a_200k_whitespace_run_of_%s_whenCompiling_thenItCompletesPromptly",
+    (_name, run) => {
+      const started = performance.now();
+
+      const line = compiledOutputLine(`start${run}end`);
+
+      expect(performance.now() - started).toBeLessThan(1000);
+      // Still the documented output: a run with a line break collapses to one
+      // space, a run without one is preserved verbatim.
+      expect(line.length).toBe(run.includes("\n") ? "start end".length : run.length + 8);
+    },
+  );
+});
+
 /** A chain that reuses imported artifacts: Input -> Skill -> Prompt -> Agent -> Output. */
 function importedRefDocument(): PatchworkDocument {
   return {
