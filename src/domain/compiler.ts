@@ -346,6 +346,7 @@ type CopyAttempt = { copy: VendoredCopy } | { problem: string };
  * like a Claude Code failure rather than an export decision.
  */
 function attemptCopy(
+  dirName: string,
   requestedBy: GraphNode,
   kind: ArtifactKind,
   name: string,
@@ -379,6 +380,17 @@ function attemptCopy(
   if (located?.kind !== kind || located.name !== bundleName) {
     return {
       problem: `${prefix} a copy at '${path}' would not be discoverable as '${bundleName}' — re-pick the artifact or switch the node to reference-by-name`,
+    };
+  }
+
+  // The bundle directory is the copy's namespace, and it is the *joined* name that
+  // Claude Code resolves. Two segments that are each acceptable can still overrun
+  // the whole-name bound together (a 64-character directory and a 64-character leaf
+  // make 129), and then the copy is on disk under a name the scanner rejects.
+  const invocation = `${dirName}:${bundleName}`;
+  if (!isValidArtifactName(invocation)) {
+    return {
+      problem: `${prefix} inside the bundle it would be invoked as '${invocation}', which is not a name Claude Code can resolve — shorten the workflow name, pick an artifact with a shorter name, or switch the node to reference-by-name`,
     };
   }
 
@@ -431,6 +443,7 @@ function planBundle(
     const requestedBy = requests.get(key);
     if (requestedBy) {
       const attempt = attemptCopy(
+        dirName,
         requestedBy,
         kind,
         ref.name,

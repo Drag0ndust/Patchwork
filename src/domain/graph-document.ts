@@ -6,7 +6,11 @@
  * canvas, but the document itself is the source of truth for compilation.
  */
 
-import { isValidArtifactName, type ArtifactKind } from "./artifact-codec";
+import {
+  isValidArtifactName,
+  MAX_NAME_SEGMENT_LENGTH,
+  type ArtifactKind,
+} from "./artifact-codec";
 
 /**
  * Bumped to 3 in slice 3: a `skill`/`agent` node now records *how* it is
@@ -159,25 +163,45 @@ const EMITTER_NAME_COST = 1 + 11 + 8 + 11 + 20;
 export const BUNDLE_DIR_PREFIX = "patchwork-";
 
 /**
- * How long the exported bundle's directory name may be.
- *
- * This — not the length of the name as typed — is the real limit, because the one
- * field that becomes a *filename* becomes it via `slugify`, and a slug is not the
- * same length as its name in either direction:
- *
- * - **Longer.** `toLowerCase` can expand a character. `İ` (U+0130, on every Turkish
- *   keyboard) becomes `i` + U+0307, and the combining mark is not `[a-z0-9]`, so
- *   each one slugs to `i-`: a 101-character name can produce a 210-character
- *   directory. It is the only such code point, and one is enough.
- * - **Shorter.** 250 spaces slug to nothing at all, so a name-length rule would
- *   refuse names that export perfectly well.
+ * What the *filesystem* allows the bundle directory to be called, once the room
+ * the Bundle Emitter's own temporary names need is taken out.
  *
  * Bounded here rather than left to the emitter because the failure otherwise
  * surfaces at the far end of the export, as the operating system's "File name too
  * long" naming a temporary directory the user has never seen and cannot connect to
  * the name they typed.
  */
-export const MAX_BUNDLE_DIR_LENGTH = MAX_PATH_COMPONENT_LENGTH - EMITTER_NAME_COST;
+const MAX_BUNDLE_DIR_PATH_LENGTH = MAX_PATH_COMPONENT_LENGTH - EMITTER_NAME_COST;
+
+/**
+ * How long the exported bundle's directory name may be.
+ *
+ * Two independent bounds meet here, and the *smaller* is the rule:
+ *
+ * - the filesystem's, via [`MAX_BUNDLE_DIR_PATH_LENGTH`];
+ * - **discoverability's.** The bundle directory is not only a directory: dropped
+ *   into a source root it is the name Claude Code discovers the umbrella skill by,
+ *   and — when the bundle vendors anything — the plugin namespace every bundled
+ *   capability is invoked under (`patchwork-<slug>:tdd`). Both are *artifact name
+ *   segments*, so a directory the Import Scanner would reject is an export that
+ *   succeeds and then resolves to nothing. That is the binding one today, by a
+ *   wide margin.
+ *
+ * This — not the length of the name as typed — is the limit, because the one field
+ * that becomes a *filename* becomes it via `slugify`, and a slug is not the same
+ * length as its name in either direction:
+ *
+ * - **Longer.** `toLowerCase` can expand a character. `İ` (U+0130, on every Turkish
+ *   keyboard) becomes `i` + U+0307, and the combining mark is not `[a-z0-9]`, so
+ *   each one slugs to `i-`: a 29-character name can produce a 66-character
+ *   directory. It is the only such code point, and one is enough.
+ * - **Shorter.** 250 spaces slug to nothing at all, so a name-length rule would
+ *   refuse names that export perfectly well.
+ */
+export const MAX_BUNDLE_DIR_LENGTH = Math.min(
+  MAX_BUNDLE_DIR_PATH_LENGTH,
+  MAX_NAME_SEGMENT_LENGTH,
+);
 
 /** The longest name that is safe whatever it contains — for advice, not the rule. */
 export const MAX_WORKFLOW_NAME_LENGTH =
@@ -243,7 +267,7 @@ export function validateGraph(doc: PatchworkDocument): ValidationResult {
   const dirLength = BUNDLE_DIR_PREFIX.length + slugify(name).length;
   if (dirLength > MAX_BUNDLE_DIR_LENGTH) {
     errors.push(
-      `Workflow name is too long to export: it becomes the bundle directory '${BUNDLE_DIR_PREFIX}<slug>', which must be at most ${MAX_BUNDLE_DIR_LENGTH} characters because the export writes through a longer temporary sibling directory — this name produces ${dirLength}. Shorten it (up to ${MAX_WORKFLOW_NAME_LENGTH} characters is always safe).`,
+      `Workflow name is too long to export: it becomes the bundle directory '${BUNDLE_DIR_PREFIX}<slug>', which is also the name Claude Code discovers the exported skill by (and the namespace of anything bundled with it), so it must be at most ${MAX_BUNDLE_DIR_LENGTH} characters — this name produces ${dirLength}. Shorten it (up to ${MAX_WORKFLOW_NAME_LENGTH} characters is always safe).`,
     );
   }
 

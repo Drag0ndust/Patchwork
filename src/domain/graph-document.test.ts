@@ -1,7 +1,9 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { isValidArtifactName } from "./artifact-codec";
 import {
+  BUNDLE_DIR_PREFIX,
   CURRENT_SCHEMA_VERSION,
   MAX_BUNDLE_DIR_LENGTH,
   MAX_WORKFLOW_NAME_LENGTH,
@@ -11,6 +13,7 @@ import {
   deserialize,
   exportModeOf,
   serialize,
+  slugify,
   validateGraph,
 } from "./graph-document";
 
@@ -168,7 +171,7 @@ describe("validateGraph — workflow name usable as a skill name", () => {
   );
 });
 
-describe("validateGraph — the bundle directory name has to fit a filesystem", () => {
+describe("validateGraph — the bundle directory name has to stay discoverable", () => {
   function named(name: string): PatchworkDocument {
     const doc = linearDocument();
     doc.workflow.name = name;
@@ -182,9 +185,9 @@ describe("validateGraph — the bundle directory name has to fit a filesystem", 
    * `İ` (U+0130, LATIN CAPITAL LETTER I WITH DOT ABOVE — on every Turkish
    * keyboard) lowercases to *two* code units, `i` + U+0307, and the combining mark
    * is not `[a-z0-9]`, so `slugify` turns each one into `i-`: the slug is twice the
-   * length of the name. Bounding the typed name would accept a 101-character name
-   * that produces a 210-character directory, which is the exact failure this bound
-   * exists to keep out of the Bundle Emitter.
+   * length of the name. Bounding the typed name would accept a 29-character name
+   * that produces a 66-character directory, which is the exact failure this bound
+   * exists to keep out of the export.
    *
    * It runs the other way too — 250 spaces slug to nothing — so a name-length rule
    * would also refuse names that export perfectly well.
@@ -192,26 +195,39 @@ describe("validateGraph — the bundle directory name has to fit a filesystem", 
   it.each([
     ["at the limit in plain ASCII", "a".repeat(MAX_WORKFLOW_NAME_LENGTH), true],
     ["one character past it", "a".repeat(MAX_WORKFLOW_NAME_LENGTH + 1), false],
-    ["short but slug-doubling (U+0130)", `a${"İ".repeat(193)}`, false],
-    ["the smallest slug-doubling overflow", `a${"İ".repeat(100)}`, false],
+    ["short but slug-doubling (U+0130)", `a${"İ".repeat(100)}`, false],
+    ["the smallest slug-doubling overflow", `a${"İ".repeat(28)}`, false],
+    ["one İ short of it", `a${"İ".repeat(27)}`, true],
     ["long but slugging to almost nothing", `a${" ".repeat(250)}`, true],
   ])("given_aWorkflowName_%s_whenValidating_thenAcceptedIs_%s", (_case, name, ok) => {
     expect(validateGraph(named(name)).ok).toBe(ok);
   });
 
   it("given_aSlugTooLongToExport_whenValidating_thenTheErrorNamesTheFieldAndBothLengths", () => {
-    const result = validateGraph(named(`a${"İ".repeat(100)}`));
+    const result = validateGraph(named(`a${"İ".repeat(28)}`));
 
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("expected failure");
     expect(result.errors).toContain(
-      `Workflow name is too long to export: it becomes the bundle directory 'patchwork-<slug>', which must be at most ${MAX_BUNDLE_DIR_LENGTH} characters because the export writes through a longer temporary sibling directory — this name produces 210. Shorten it (up to ${MAX_WORKFLOW_NAME_LENGTH} characters is always safe).`,
+      `Workflow name is too long to export: it becomes the bundle directory 'patchwork-<slug>', which is also the name Claude Code discovers the exported skill by (and the namespace of anything bundled with it), so it must be at most ${MAX_BUNDLE_DIR_LENGTH} characters — this name produces 66. Shorten it (up to ${MAX_WORKFLOW_NAME_LENGTH} characters is always safe).`,
     );
   });
 
+  it("given_theLongestExportableName_whenSlugged_thenTheBundleDirIsStillAnArtifactName", () => {
+    // The binding half of the bound: the bundle directory is the name the umbrella
+    // skill is discovered by and the namespace its vendored capabilities are
+    // invoked under, so a directory the codec would reject is an export that
+    // succeeds and then resolves to nothing.
+    const longest = `${BUNDLE_DIR_PREFIX}${slugify("a".repeat(MAX_WORKFLOW_NAME_LENGTH))}`;
+
+    expect(longest.length).toBe(MAX_BUNDLE_DIR_LENGTH);
+    expect(isValidArtifactName(longest)).toBe(true);
+    expect(isValidArtifactName(`${longest}x`)).toBe(false);
+  });
+
   it("given_theLimit_whenComparedWithWhatTheEmitterAdds_thenAWholeStagingNameStillFits", () => {
-    // The bound exists to keep the *emitter's* longest name within a path
-    // component: `.<dirName>.patchwork-previous-<pid>-<nanos>`. Pinned from the Rust
+    // The other half: the emitter's longest name has to stay within a path
+    // component — `.<dirName>.patchwork-previous-<pid>-<nanos>`. Pinned from the Rust
     // side too, against these very constants — see
     // `given_the_staging_name_cost_then_it_matches_the_workflow_name_bound`.
     const longestEmitterName = `.${"d".repeat(MAX_BUNDLE_DIR_LENGTH)}.patchwork-previous-${"9".repeat(10)}-${"9".repeat(19)}`;

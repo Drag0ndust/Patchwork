@@ -3018,7 +3018,8 @@ mod tests {
             source
                 .lines()
                 .find_map(|line| {
-                    line.trim()
+                    let declaration = line.trim().trim_start_matches("export ");
+                    declaration
                         .strip_prefix(&format!("const {name} = "))
                         .and_then(|rest| rest.trim_end_matches(';').parse::<usize>().ok())
                 })

@@ -44,8 +44,13 @@ const MAX_NAME_SEGMENTS = 2;
  * canvas, so they are length-bounded too: a directory name can be as long as the
  * filesystem allows, and a 500-character one would wreck the umbrella's prose
  * without being a plausible artifact.
+ *
+ * The segment bound is exported because Patchwork also *produces* names that have
+ * to survive being scanned back in: the bundle directory is a namespace segment,
+ * so the Graph Document bounds the workflow name against this constant rather
+ * than restating the number (see `MAX_BUNDLE_DIR_LENGTH`).
  */
-const MAX_NAME_SEGMENT_LENGTH = 64;
+export const MAX_NAME_SEGMENT_LENGTH = 64;
 const MAX_NAME_LENGTH = 128;
 
 /** True if `name` is usable as an artifact name (and safe to render inline). */

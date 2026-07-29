@@ -4,13 +4,19 @@ import { describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
 import {
   isValidArtifactName,
+  MAX_NAME_SEGMENT_LENGTH,
   parseArtifact,
   parseArtifactLocation,
   type Artifact,
   type ArtifactKind,
 } from "./artifact-codec";
 import { compile, slugify, vendorErrors, type BundleTree } from "./compiler";
-import { CURRENT_SCHEMA_VERSION, type PatchworkDocument } from "./graph-document";
+import {
+  CURRENT_SCHEMA_VERSION,
+  MAX_BUNDLE_DIR_LENGTH,
+  MAX_WORKFLOW_NAME_LENGTH,
+  type PatchworkDocument,
+} from "./graph-document";
 
 /** The canonical linear graph used as the golden reference. */
 function canonicalLinearDocument(): PatchworkDocument {
@@ -1007,6 +1013,59 @@ describe("compile — two vendored artifacts that share a leaf name", () => {
     expect(vendorErrors(doc, [...availableArtifacts(), artifact])).toEqual([
       `Skill node 'n2' is set to copy '${tooLong}' into the bundle, but '${tooLong}' is not a name a copy can be given inside the bundle — re-pick the artifact or switch the node to reference-by-name`,
     ]);
+  });
+
+  it("given_aBundleNameThatOnlyOverrunsTheLimitOnceNamespaced_whenCompiling_thenTheCopyIsRefused", () => {
+    // Both halves are legal on their own — a bundle directory at its own ceiling
+    // and an artifact whose leaf is at the segment ceiling — and the name Claude
+    // Code actually resolves is the two joined, which is one character too long.
+    // Copying anyway would put a file in the bundle under a name the Import
+    // Scanner rejects: an export that succeeds and then resolves to nothing.
+    const leaf = "b".repeat(MAX_NAME_SEGMENT_LENGTH);
+    const artifact: Artifact = {
+      kind: "skill",
+      name: leaf,
+      description: "Long leaf.",
+      fields: {},
+      body: "\nBody.\n",
+      frontmatter: { open: "---\n", text: "description: Long leaf.", close: "\n---\n" },
+    };
+    const doc = vendorMixDocument();
+    doc.workflow.name = "w".repeat(MAX_WORKFLOW_NAME_LENGTH);
+    doc.nodes[1].data = { name: leaf, rootId: "personal", exportMode: "vendor" };
+    const artifacts = [...availableArtifacts(), artifact];
+    const dirName = `patchwork-${slugify(doc.workflow.name)}`;
+    expect(dirName.length).toBe(MAX_BUNDLE_DIR_LENGTH);
+
+    const tree = compile(doc, artifacts);
+
+    expect(tree.files.map((f) => f.path)).not.toContain(`skills/${leaf}/SKILL.md`);
+    expect(vendorErrors(doc, artifacts)).toEqual([
+      `Skill node 'n2' is set to copy '${leaf}' into the bundle, but inside the bundle it would be invoked as '${dirName}:${leaf}', which is not a name Claude Code can resolve — shorten the workflow name, pick an artifact with a shorter name, or switch the node to reference-by-name`,
+    ]);
+  });
+
+  it("given_aBundleNameThatFitsOnceNamespaced_whenCompiling_thenItIsStillVendored", () => {
+    // The mirror case one character shorter, so the guard bounds the joined name
+    // rather than banning long leaves outright.
+    const leaf = "b".repeat(MAX_NAME_SEGMENT_LENGTH - 1);
+    const artifact: Artifact = {
+      kind: "skill",
+      name: leaf,
+      description: "Long leaf.",
+      fields: {},
+      body: "\nBody.\n",
+      frontmatter: { open: "---\n", text: "description: Long leaf.", close: "\n---\n" },
+    };
+    const doc = vendorMixDocument();
+    doc.workflow.name = "w".repeat(MAX_WORKFLOW_NAME_LENGTH);
+    doc.nodes[1].data = { name: leaf, rootId: "personal", exportMode: "vendor" };
+    const artifacts = [...availableArtifacts(), artifact];
+
+    expect(compile(doc, artifacts).files.map((f) => f.path)).toContain(
+      `skills/${leaf}/SKILL.md`,
+    );
+    expect(vendorErrors(doc, artifacts)).toEqual([]);
   });
 
   it("given_everyCollisionFallback_whenCompiling_thenEachBundledNameIsStillAUsableArtifactName", () => {
