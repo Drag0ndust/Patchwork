@@ -94,13 +94,17 @@ fn validate_bundle_paths(tree: &BundleTree) -> Result<(), String> {
 /// that never landed. Staging removes the window instead of narrowing it, and it
 /// covers a second process exporting concurrently, which no in-process lock could.
 ///
+/// An export also **reaps** the hidden siblings its own earlier exports left in
+/// this destination (see [`reap_leftovers`]), because each of those is a full copy
+/// of a bundle and nothing else would ever remove them.
+///
 /// Paths are validated *before* any filesystem mutation so a malicious or
 /// buggy renderer cannot direct the recursive delete/write outside `dest_dir`.
 pub fn write_bundle(tree: &BundleTree, dest_dir: &Path) -> Result<PathBuf, String> {
     validate_bundle_paths(tree)?;
 
     let bundle_dir = dest_dir.join(&tree.dir_name);
-    let staging = dest_dir.join(staging_name(&tree.dir_name, "staging"));
+    let staging = dest_dir.join(staging_name(&tree.dir_name, STAGING_ROLE));
 
     // Created before anything is written into it, and separately from the fill, so
     // that every `remove_dir_all(&staging)` below can only ever remove a directory
@@ -108,16 +112,32 @@ pub fn write_bundle(tree: &BundleTree, dest_dir: &Path) -> Result<PathBuf, Strin
     // returns without a cleanup, leaving whatever is there untouched.
     create_staging(&staging)?;
 
+    // Stale *staging* leftovers go now: the destination exists, this export owns its
+    // own staging directory, and a staging leftover is never the only copy of
+    // anything — so reaping here means a failing export tidies too. Never before
+    // `create_staging`, so a reap can never be blamed for a refused export.
+    reap_leftovers(dest_dir, &tree.dir_name, STAGING_ROLE);
+
     // Fill the staging directory first; nothing at the destination is touched
     // until it holds the complete bundle.
     if let Err(e) = fill_staging(tree, &staging) {
-        // Best-effort: the failure being reported is the one worth reporting.
+        // Best-effort: the failure being reported is the one worth reporting, and
+        // anything this leaves behind is what a later export's reap is for.
         let _ = fs::remove_dir_all(&staging);
         return Err(e);
     }
 
     match swap_in(&staging, &bundle_dir, &tree.dir_name, dest_dir) {
-        Ok(()) => Ok(bundle_dir),
+        Ok(()) => {
+            // Only now, and deliberately not with the staging reap above: an export
+            // killed between `swap_in`'s two renames leaves the bundle's ONLY copy
+            // under the retired name, so an export that reaped it and then failed
+            // would destroy the last copy of a bundle — the very outcome staging
+            // exists to prevent. Here the new bundle is already in place, so nothing
+            // that gets removed is anyone's only copy.
+            reap_leftovers(dest_dir, &tree.dir_name, RETIRED_ROLE);
+            Ok(bundle_dir)
+        }
         Err(e) => {
             let _ = fs::remove_dir_all(&staging);
             Err(e)
@@ -129,15 +149,143 @@ pub fn write_bundle(tree: &BundleTree, dest_dir: &Path) -> Result<PathBuf, Strin
 /// directory so the swap is a rename within one filesystem (a rename across
 /// filesystems fails, and copying would reintroduce the partial-write window).
 ///
-/// The suffix is unique per call so an export never removes a directory it did not
-/// create — including a leftover from a previous crashed export, which stays put
-/// under a name that says what it is rather than being silently deleted.
+/// The suffix is unique per call so an export never *swaps in* a directory it did
+/// not create. It also dates the directory: a leftover from a crashed export is
+/// removed by a later export of the same bundle, but only once it is old enough that
+/// no export could still be filling it — see [`reap_leftovers`].
 fn staging_name(dir_name: &str, role: &str) -> String {
-    let stamp = std::time::SystemTime::now()
+    format!(
+        ".{dir_name}.patchwork-{role}-{}-{}",
+        std::process::id(),
+        nanos_now()
+    )
+}
+
+/// Nanoseconds since the epoch, which is both the uniqueness and the **age** of a
+/// staging or retired name — [`reap_leftovers`] reads it back out of the name.
+///
+/// A clock before the epoch yields 0, which reads as ancient. That only matters on
+/// a machine whose clock is set before 1970, where an export's own working
+/// directory could look reapable to a concurrent export; the alternative (refusing
+/// to export) would be worse.
+fn nanos_now() -> u128 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!(".{dir_name}.patchwork-{role}-{}-{stamp}", std::process::id())
+        .unwrap_or(0)
+}
+
+/// The role of the directory an export fills before swapping it in. A leftover of
+/// this role is a bundle that was never delivered, so removing one can never take
+/// away anybody's only copy.
+const STAGING_ROLE: &str = "staging";
+
+/// The role of a bundle that was renamed aside to make room for a new one. A
+/// leftover of this role may be the **only** copy of that bundle (an export killed
+/// between `swap_in`'s two renames), which is why it is reaped only after a swap has
+/// succeeded — see [`write_bundle`].
+const RETIRED_ROLE: &str = "previous";
+
+/// How old a leftover must be before an export will remove it.
+///
+/// The pid and the stamp in the name are all the material there is, and neither can
+/// say whether the process that wrote it is still alive: a pid may have been reused,
+/// and a foreign pid may well be a second Patchwork window exporting right now.
+/// Age is the stand-in — an hour is orders of magnitude longer than writing a
+/// handful of Markdown files takes, even onto a slow network volume. An export that
+/// somehow ran longer than this loses its staging directory and then fails at the
+/// swap, which reports an error and destroys nothing — its staging directory holds a
+/// bundle that was never delivered. What a *retired* leftover of that age may be is
+/// a different question, and it is answered by when each role is reaped rather than
+/// by the age alone (see [`write_bundle`]).
+const REAP_AFTER_NANOS: u128 = 60 * 60 * 1_000_000_000;
+
+/// The age stamp of a hidden sibling that belongs to `dir_name`'s own exports in the
+/// given `role`, or `None` for anything else in the destination.
+///
+/// The rule is **exact**, not a prefix guess, because this decides what an export
+/// deletes inside a directory the user picked: the name must be
+/// `.{dir_name}.patchwork-{role}-{pid}-{stamp}`, with both numeric fields
+/// all-ASCII-digits (`parse` alone would accept `+1`). A leftover of a *different*
+/// bundle in the same destination does not match, and neither does anything a
+/// different tool left there.
+///
+/// The role is an argument rather than "either of the two" because the two are
+/// reaped at different moments, and that timing is what protects a retired bundle
+/// that may be the last copy of itself.
+fn leftover_stamp(name: &str, dir_name: &str, role: &str) -> Option<u128> {
+    let rest = name.strip_prefix(&format!(".{dir_name}.patchwork-{role}-"))?;
+    let (pid, stamp) = rest.split_once('-')?;
+    let numeric = |field: &str| !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit());
+    if !numeric(pid) || !numeric(stamp) {
+        return None;
+    }
+    stamp.parse().ok()
+}
+
+/// Remove a leftover, whether it is a directory, a file, or a symlink.
+///
+/// `remove_dir_all` alone is not enough: a *file* can sit where the bundle belongs
+/// (and then gets retired under a hidden name), and so can a symlink — which must
+/// be unlinked rather than followed, so that retiring a link to the user's own data
+/// never touches what it pointed at.
+fn remove_leftover(path: &Path) -> std::io::Result<()> {
+    if fs::symlink_metadata(path)?.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+/// Remove the hidden siblings of one `role` that earlier exports of *this* bundle
+/// left behind.
+///
+/// Two ways they accumulate: an export that died between its two renames, and a
+/// retired copy whose removal failed (a file where `remove_dir_all` wanted a
+/// directory). Both are full copies of a bundle, so "it stays put, named for what
+/// it is" — what ADR-0002 first said — meant a destination that only ever grew.
+///
+/// One role per call, because [`write_bundle`] reaps them at different points: a
+/// `previous` leftover can be the only copy of a bundle, so it must not be removed
+/// by an export that has not yet succeeded.
+///
+/// Nothing here can fail the export: the bundle is what the user asked for, and a
+/// tidying problem must not be reported as an export failure — this returns `()`, so
+/// it cannot reach `write_bundle`'s `Result` even by accident.
+///
+/// It is not *dropped* either, because silence is exactly what let the retired-file
+/// leak go unnoticed: a reap that fails prints to stderr naming the path, so it can
+/// be removed by hand. Be honest about how far that reaches. These are the only
+/// `eprintln!`s in the crate — there is no diagnostic stream to join — so they show
+/// up when the app is run from a terminal (`tauri dev`, `cargo test`) and, for a
+/// Finder-launched `.app` on macOS, in the unified log. On a **packaged Windows
+/// release** they go nowhere at all: `main.rs` sets `windows_subsystem = "windows"`,
+/// which detaches the console. That is accepted rather than solved here — the
+/// failure is a non-fatal tidy-up of a path whose name says what it is, and the
+/// alternative is a logging sink, which is a bigger decision than this cleanup
+/// warrants.
+fn reap_leftovers(dest_dir: &Path, dir_name: &str, role: &str) {
+    let entries = match fs::read_dir(dest_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("Patchwork: could not list {dest_dir:?} to clean up old exports: {e}");
+            return;
+        }
+    };
+    let now = nanos_now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(stamp) = name.to_str().and_then(|n| leftover_stamp(n, dir_name, role)) else {
+            continue;
+        };
+        if now.saturating_sub(stamp) < REAP_AFTER_NANOS {
+            continue; // Young enough to be a live export's own working directory.
+        }
+        let path = entry.path();
+        if let Err(e) = remove_leftover(&path) {
+            eprintln!("Patchwork: could not remove the leftover export directory {path:?}: {e}");
+        }
+    }
 }
 
 /// Create the staging directory, which must not already exist.
@@ -182,18 +330,24 @@ fn fill_staging(tree: &BundleTree, staging: &Path) -> Result<(), String> {
 ///
 /// The restore can fail too — the fault that broke the swap may equally break it —
 /// and then the user's bundle is intact but *hidden*, under a name they have no
-/// reason to guess. That double fault gets its own error naming the retired path,
-/// because "the export failed" would be actively misleading about a bundle that
-/// still exists and is one rename away from being recovered.
+/// reason to guess. That double fault gets its own error naming the retired path
+/// ([`double_fault_message`]), because "the export failed" would be actively
+/// misleading about a bundle that still exists and is one rename away from being
+/// recovered.
+///
+/// What counts as "an existing bundle" is judged with `symlink_metadata`, not
+/// `exists()`: `exists()` follows links, so a **dangling** symlink at the bundle
+/// path was invisible here — nothing was retired, `rename` then failed with `Not a
+/// directory`, and every future export failed the same way. A stale link wedged the
+/// destination permanently, with a message that named none of that.
 fn swap_in(
     staging: &Path,
     bundle_dir: &Path,
     dir_name: &str,
     dest_dir: &Path,
 ) -> Result<(), String> {
-    let retired = bundle_dir
-        .exists()
-        .then(|| dest_dir.join(staging_name(dir_name, "previous")));
+    let retired =
+        is_present(bundle_dir).then(|| dest_dir.join(staging_name(dir_name, RETIRED_ROLE)));
 
     if let Some(retired) = &retired {
         fs::rename(bundle_dir, retired).map_err(|e| {
@@ -204,22 +358,47 @@ fn swap_in(
     if let Err(e) = fs::rename(staging, bundle_dir) {
         if let Some(retired) = &retired {
             if let Err(restore) = fs::rename(retired, bundle_dir) {
-                return Err(format!(
-                    "Failed to move the new bundle into {bundle_dir:?} ({e}), and the \
-                     previous bundle could not be put back ({restore}). It is intact at \
-                     {retired:?} — rename that directory back to {bundle_dir:?} to recover it."
-                ));
+                return Err(double_fault_message(bundle_dir, &e, &restore, retired));
             }
         }
         return Err(format!("Failed to move the new bundle into {bundle_dir:?}: {e}"));
     }
 
     // The export succeeded; a leftover retired copy is untidy, not a failure, so
-    // it must not turn a written bundle into a reported error.
+    // it must not turn a written bundle into a reported error. It is printed rather
+    // than dropped, though — a retired *file* or symlink used to fail here silently
+    // and linger for ever (see `remove_leftover`), and a later export only reaps it
+    // once it is an hour old. How far that print reaches, and where it does not, is
+    // set out on `reap_leftovers`.
     if let Some(retired) = &retired {
-        let _ = fs::remove_dir_all(retired);
+        if let Err(e) = remove_leftover(retired) {
+            eprintln!("Patchwork: could not remove the retired bundle at {retired:?}: {e}");
+        }
     }
     Ok(())
+}
+
+/// What the user is told when the swap failed *and* the previous bundle could not be
+/// put back — the one branch of the emitter whose message is a data-recovery
+/// instruction rather than a diagnosis.
+///
+/// Pulled out as a pure function so it can be asserted on directly. Provoking the
+/// real double fault needs two filesystem faults with different timing, and every
+/// seam that would allow it (a rename-injection parameter, a `cfg(test)` hook
+/// between the two renames) puts test machinery inside the emitter's production
+/// path. What actually matters to the user is the text: that it names the path their
+/// bundle survived at, and says what to do with it.
+fn double_fault_message(
+    bundle_dir: &Path,
+    swap: &std::io::Error,
+    restore: &std::io::Error,
+    retired: &Path,
+) -> String {
+    format!(
+        "Failed to move the new bundle into {bundle_dir:?} ({swap}), and the previous bundle \
+         could not be put back ({restore}). It is intact at {retired:?} — rename that directory \
+         back to {bundle_dir:?} to recover it."
+    )
 }
 
 /// Bundle Emitter command: write the compiled tree to the chosen drop location.
@@ -1339,8 +1518,8 @@ mod tests {
         let reserved = ts_const(&ts, "EMITTER_NAME_COST");
         let max_dir_name = max_component - reserved;
 
-        // `previous` is the longer of the two roles, so it is the binding case.
-        let longest = staging_name(&"d".repeat(max_dir_name), "previous");
+        // `staging` is the longer of the two roles, so it is the binding case.
+        let longest = staging_name(&"d".repeat(max_dir_name), STAGING_ROLE);
 
         assert!(
             longest.len() - max_dir_name <= reserved,
@@ -1359,11 +1538,13 @@ mod tests {
     /// staging directory exists and the destination is free, so the rename
     /// succeeds). A missing staging directory reproduces the same branch.
     ///
-    /// The *double* fault — this rename failing and the restore failing too — is
-    /// deliberately not tested: it needs two independent filesystem faults with
-    /// different timing, and forcing it would mean injecting a rename seam into the
-    /// emitter purely for the test. Its handling is the error message named in
-    /// `swap_in`'s doc comment, reviewed rather than covered.
+    /// The *double* fault — this rename failing and the restore failing too — needs
+    /// two independent filesystem faults with different timing, so the branch itself
+    /// is still not driven here (a rename seam in the emitter would be test
+    /// machinery in the production path). What that branch produces is covered
+    /// instead: it is a pure function, and
+    /// `given_a_swap_and_a_restore_that_both_failed_when_reported_then_the_message_says_where_the_bundle_is_and_how_to_recover`
+    /// asserts the recovery instruction the user actually depends on.
     #[test]
     fn given_a_swap_that_fails_when_rolled_back_then_the_previous_bundle_is_where_it_was() {
         let dest = tempfile::tempdir().unwrap();
@@ -1423,6 +1604,274 @@ mod tests {
             1,
             "the swap must not leave a staging or retired directory behind"
         );
+    }
+
+    /// The names an export forms for its own hidden siblings, as a test can plant
+    /// them: role, the pid of whatever produced them, and the nanosecond stamp
+    /// that says how old they are.
+    fn leftover(dir_name: &str, role: &str, pid: u32, stamp: u128) -> String {
+        format!(".{dir_name}.patchwork-{role}-{pid}-{stamp}")
+    }
+
+    /// A stamp far enough in the past that no export could still be running.
+    const ANCIENT: u128 = 0;
+
+    /// The names an export forms and the names it reaps are two sides of one rule, in
+    /// two functions: if they ever drift, reaping silently stops happening and the
+    /// leak comes back with every test still green. The roles must also stay
+    /// **distinguishable**, because when each is reaped is what keeps a retired
+    /// bundle safe from an export that never completes.
+    #[test]
+    fn given_the_names_an_export_forms_then_the_reaper_recognizes_each_role_and_only_that_role() {
+        for (role, other) in [(STAGING_ROLE, RETIRED_ROLE), (RETIRED_ROLE, STAGING_ROLE)] {
+            let name = staging_name("patchwork-demo", role);
+
+            let stamp = leftover_stamp(&name, "patchwork-demo", role);
+
+            assert!(
+                stamp.is_some(),
+                "the reaper does not recognize the {role} name this emitter writes: {name}"
+            );
+            assert!(
+                nanos_now().saturating_sub(stamp.unwrap()) < REAP_AFTER_NANOS,
+                "a name formed just now must be too young to reap: {name}"
+            );
+            assert!(
+                leftover_stamp(&name, "patchwork-demo", other).is_none(),
+                "a {role} leftover must not be reaped as a {other} one: {name}"
+            );
+        }
+    }
+
+    /// A kill between `swap_in`'s two renames leaves the bundle's **only** copy under
+    /// the retired name. Reaping both roles up front meant a later export that then
+    /// *failed* deleted it — an export that wrote nothing destroying the last copy of
+    /// a bundle, which is exactly what the staging design exists to prevent. So the
+    /// roles are reaped at different times: a staging leftover (never a sole copy)
+    /// before the fill, a retired one only after a swap has succeeded.
+    #[test]
+    fn given_an_export_that_fails_when_a_retired_leftover_is_the_last_copy_then_it_survives() {
+        let dest = tempfile::tempdir().unwrap();
+        let orphan = dest
+            .path()
+            .join(leftover("patchwork-demo", RETIRED_ROLE, 999, ANCIENT));
+        write_file(orphan.join("SKILL.md"), "the only copy of that bundle");
+        let stale_staging = dest
+            .path()
+            .join(leftover("patchwork-demo", STAGING_ROLE, 999, ANCIENT));
+        write_file(stale_staging.join("SKILL.md"), "a crashed fill");
+
+        let result = write_bundle(&unwritable_tree("patchwork-demo"), dest.path());
+
+        assert!(result.is_err(), "the export must have failed");
+        assert_eq!(
+            fs::read_to_string(orphan.join("SKILL.md")).unwrap(),
+            "the only copy of that bundle",
+            "an export that wrote nothing must not delete the last copy of a bundle"
+        );
+        assert!(
+            !is_present(&stale_staging),
+            "a stale staging leftover is never a sole copy, so a failing export still reaps it"
+        );
+    }
+
+    /// The retired copy of a previous bundle is deleted with `remove_dir_all`, which
+    /// cannot remove a **file** — and the cleanup is deliberately best-effort, so the
+    /// error was swallowed and the hidden copy of the user's file stayed in their
+    /// export directory for ever.
+    #[test]
+    fn given_a_regular_file_where_the_bundle_belongs_when_exported_then_the_retired_file_is_removed()
+    {
+        let dest = tempfile::tempdir().unwrap();
+        fs::write(dest.path().join("patchwork-demo"), "not a bundle at all").unwrap();
+
+        let bundle =
+            write_bundle(&tree("patchwork-demo", &[("SKILL.md", "v1")]), dest.path()).unwrap();
+
+        assert_eq!(fs::read_to_string(bundle.join("SKILL.md")).unwrap(), "v1");
+        assert_eq!(
+            fs::read_dir(dest.path()).unwrap().count(),
+            1,
+            "the retired file must not linger beside the bundle: {:?}",
+            entry_names(dest.path())
+        );
+    }
+
+    /// The reaper's whole job: a leftover of *this* bundle that no live export can
+    /// still be using is removed, whether it is a directory (a crashed export's
+    /// staging copy, a full copy of the bundle) or a file (a retired non-bundle).
+    #[test]
+    fn given_stale_leftovers_of_this_bundle_when_exported_then_a_directory_and_a_file_are_both_reaped(
+    ) {
+        let dest = tempfile::tempdir().unwrap();
+        let stale_dir = dest.path().join(leftover("patchwork-demo", "staging", 999, ANCIENT));
+        write_file(stale_dir.join("skills/ghost/SKILL.md"), "a crashed export");
+        let stale_file = dest
+            .path()
+            .join(leftover("patchwork-demo", "previous", 998, ANCIENT));
+        fs::write(&stale_file, "a retired non-bundle").unwrap();
+
+        write_bundle(&tree("patchwork-demo", &[("SKILL.md", "v1")]), dest.path()).unwrap();
+
+        assert!(!is_present(&stale_dir), "a stale staging directory must be reaped");
+        assert!(!is_present(&stale_file), "a stale retired file must be reaped");
+        assert_eq!(
+            entry_names(dest.path()),
+            vec!["patchwork-demo".to_string()],
+            "only the bundle may be left"
+        );
+    }
+
+    /// Deletion happens in a directory the *user* picked, so the matching rule is
+    /// exact rather than a prefix guess: another bundle's leftover, another tool's
+    /// hidden directory, an unknown role, and a name whose pid/stamp fields are not
+    /// numbers are all somebody else's business.
+    #[test]
+    fn given_leftovers_that_do_not_match_this_bundles_pattern_when_exported_then_they_are_left_alone(
+    ) {
+        let dest = tempfile::tempdir().unwrap();
+        let strangers = [
+            leftover("patchwork-other-flow", "previous", 999, ANCIENT),
+            leftover("patchwork-demo", "cache", 999, ANCIENT),
+            leftover("patchwork-demo", "previous", 999, ANCIENT) + "-extra",
+            ".patchwork-demo.patchwork-previous-abc-0".to_string(),
+            ".patchwork-demo.patchwork-previous-999".to_string(),
+            ".some-other-tool-cache".to_string(),
+            "patchwork-demo-notes".to_string(),
+        ];
+        for name in &strangers {
+            write_file(dest.path().join(name).join("inside.md"), "not ours");
+        }
+
+        write_bundle(&tree("patchwork-demo", &[("SKILL.md", "v1")]), dest.path()).unwrap();
+
+        for name in &strangers {
+            assert!(
+                dest.path().join(name).join("inside.md").is_file(),
+                "{name} does not match this bundle's own pattern and must survive"
+            );
+        }
+    }
+
+    /// The pid and the stamp in a leftover's name cannot say whether the process
+    /// that made it is still running, so age is what stands in for liveness: a
+    /// leftover young enough to belong to an export in flight — in this process or
+    /// any other — is left alone. Reaping a live export's staging directory would
+    /// break an export that is about to succeed, which is far worse than a leftover.
+    #[test]
+    fn given_a_leftover_young_enough_to_belong_to_a_live_export_when_exported_then_it_is_left_alone()
+    {
+        let dest = tempfile::tempdir().unwrap();
+        let live = dest
+            .path()
+            .join(leftover("patchwork-demo", "staging", 999, nanos_now()));
+        write_file(live.join("SKILL.md"), "another export is filling this");
+
+        write_bundle(&tree("patchwork-demo", &[("SKILL.md", "v1")]), dest.path()).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(live.join("SKILL.md")).unwrap(),
+            "another export is filling this",
+            "a leftover this young may still be a live export's working directory"
+        );
+    }
+
+    /// A dangling symlink at the bundle path used to wedge the destination for good:
+    /// `exists()` is false for it, so nothing was retired, and the swap then failed
+    /// with `Not a directory` — every future export failing the same way, with a
+    /// message that did not hint at the stale link.
+    #[cfg(unix)]
+    #[test]
+    fn given_a_dangling_symlink_where_the_bundle_belongs_when_exported_then_it_is_replaced() {
+        let dest = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            dest.path().join("gone"),
+            dest.path().join("patchwork-demo"),
+        )
+        .unwrap();
+
+        let bundle =
+            write_bundle(&tree("patchwork-demo", &[("SKILL.md", "v1")]), dest.path()).unwrap();
+
+        assert_eq!(fs::read_to_string(bundle.join("SKILL.md")).unwrap(), "v1");
+        assert!(bundle.is_dir(), "the stale link must be gone, not exported through");
+        assert_eq!(
+            entry_names(dest.path()),
+            vec!["patchwork-demo".to_string()],
+            "the retired link must not linger either"
+        );
+    }
+
+    /// The other side of the same coin, and the reason retirement uses `rename`:
+    /// a symlink at the bundle path may point at data the user cares about, and
+    /// replacing the bundle must move the *link* aside, never write through it and
+    /// never delete what it pointed at.
+    #[cfg(unix)]
+    #[test]
+    fn given_a_symlink_to_real_data_where_the_bundle_belongs_when_exported_then_the_target_survives()
+    {
+        let dest = tempfile::tempdir().unwrap();
+        let precious = tempfile::tempdir().unwrap();
+        write_file(precious.path().join("notes.md"), "the user's own data");
+        std::os::unix::fs::symlink(precious.path(), dest.path().join("patchwork-demo")).unwrap();
+
+        let bundle =
+            write_bundle(&tree("patchwork-demo", &[("SKILL.md", "v1")]), dest.path()).unwrap();
+
+        assert_eq!(fs::read_to_string(bundle.join("SKILL.md")).unwrap(), "v1");
+        assert_eq!(
+            fs::read_to_string(precious.path().join("notes.md")).unwrap(),
+            "the user's own data",
+            "what the link pointed at is the user's, not the export's to delete"
+        );
+        assert!(
+            !precious.path().join("SKILL.md").exists(),
+            "the export must not have been written through the link"
+        );
+    }
+
+    /// The double-fault message is the one user-facing data-recovery text in the
+    /// emitter: the forward rename failed, the restore failed too, and the user's
+    /// bundle is intact under a hidden name they have no reason to guess. Built by a
+    /// pure function so it can be asserted on directly — no rename seam in the
+    /// emitter, and the assertion is about what the user needs (where it is, and
+    /// what to do) rather than about how the branch was reached.
+    #[test]
+    fn given_a_swap_and_a_restore_that_both_failed_when_reported_then_the_message_says_where_the_bundle_is_and_how_to_recover(
+    ) {
+        let bundle_dir = Path::new("/dest/patchwork-demo");
+        let retired = Path::new("/dest/.patchwork-demo.patchwork-previous-7-42");
+
+        let message = double_fault_message(
+            bundle_dir,
+            &std::io::Error::new(std::io::ErrorKind::NotFound, "no such file or directory"),
+            &std::io::Error::new(std::io::ErrorKind::Other, "directory not empty"),
+            retired,
+        );
+
+        assert!(
+            message.contains(".patchwork-demo.patchwork-previous-7-42"),
+            "the message must name the path the bundle survived at: {message}"
+        );
+        assert!(
+            message.contains("rename") && message.contains("patchwork-demo"),
+            "the message must say how to recover it: {message}"
+        );
+        assert!(
+            message.contains("no such file or directory") && message.contains("directory not empty"),
+            "both faults must be reported, or the cause is unrecoverable: {message}"
+        );
+    }
+
+    /// The entries of a directory by name, sorted — for assertions that care about
+    /// what an export left behind.
+    fn entry_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     /// Copy a directory tree, so a test can drop a bundle where a user would.

@@ -166,8 +166,52 @@ Two layers, deliberately, because they fail independently:
    bundle exists, so a failed export is a no-op rather than a demolition.
 
 The staging directory is a sibling so the swap stays within one filesystem, and its
-name is unique per export so no export ever deletes a directory it did not create —
-a leftover from a crashed export stays put, named for what it is.
+name is unique per export so no export ever *swaps in* a directory it did not
+create.
+
+**3c. An export reaps its own bundle's old leftovers, and nothing else's.**
+
+*Replaces this ADR's earlier "a leftover from a crashed export stays put, named for
+what it is."* That was a leak, not a policy: every leftover is a full copy of a
+bundle, so a destination only ever grew — a crashed or raced export left
+`.{dirName}.patchwork-staging-…` behind, and a retired **file** at the bundle path
+(a symlink, or a stray file the user put there) could not be removed by
+`remove_dir_all` at all, so `.{dirName}.patchwork-previous-…` lingered for ever.
+
+An export therefore removes hidden siblings whose names match its **own** bundle's
+pattern exactly — `.{dirName}.patchwork-{staging|previous}-{pid}-{nanos}`, with both
+numeric fields all digits — for the `dirName` being exported, and removes them
+whether they are directories, files, or symlinks. A leftover of a *different* bundle
+in the same destination, and anything that is not that exact shape, is left strictly
+alone: this deletes inside a directory the **user** picked, so the rule is exact
+rather than a prefix guess.
+
+The one thing the name cannot tell us is whether the export that made it is still
+running — a pid may have been reused, and a foreign pid is quite likely a second
+Patchwork window exporting right now. Age stands in for liveness: the `nanos` in the
+name must be at least an hour old. A live export's working directory is therefore
+never removed, and the cost is that a leftover survives until the next export an
+hour or more later. The reverse trade (reaping eagerly and breaking an export that
+was about to succeed) is far worse. An export that somehow ran longer than an hour
+loses its staging directory and then fails at the swap: an error, and nothing
+destroyed, because a staging directory only ever holds a bundle that was never
+delivered.
+
+**The two roles are therefore reaped at different moments, and age alone does not
+decide it.** An export killed between the swap's two renames leaves the bundle's
+*only* copy under `.{dirName}.patchwork-previous-…`. Reaping both roles before the
+fill meant a later export that then **failed** deleted that copy — an export which
+wrote nothing destroying the last copy of a bundle, which is precisely what staging
+exists to prevent. So a `staging` leftover is reaped before the fill (it can never be
+a sole copy, and this keeps a failing export tidying the common leak), while a
+`previous` leftover is reaped **only after the swap has succeeded** — at which point
+the new bundle is in place and nothing being removed is anyone's only copy. The cost
+is a retired orphan surviving until the next *successful* export, which is the right
+direction to fail in.
+
+Reaping can never fail an export — the bundle on disk is what the user asked for —
+but it is not silent either, since silence is what let the retired-file leak go
+unnoticed: a reap that fails goes to stderr naming the path.
 
 The atomic swap also settles the concurrency question the deferral was about: two
 exports can no longer interleave into one directory, whatever process they come
@@ -209,6 +253,14 @@ later, inside Claude Code.
   case of an artifact whose name could not be a path component inside the bundle:
   the planner refuses the copy and says which node to fix, rather than trusting
   that the name must have come from the codec.
+- A leftover of a bundle Patchwork no longer exports (the workflow was renamed, so
+  `dirName` changed) is never reaped, because the reaper only ever matches the
+  bundle in front of it. That is the deliberate edge of "exact, not a prefix guess",
+  and it is visible: the name says what it is and where it came from.
+- Anything at the bundle path that is not a bundle — a file, a symlink, a dangling
+  symlink — is *retired*, not written through and not deleted in place. So exporting
+  over a symlink to the user's own data moves the link aside and leaves the target
+  untouched, and a stale dangling link no longer wedges the destination.
 - Bundles grow by the size of what they carry. The scan's per-artifact ceiling
   (512 KB) bounds a single copy; nothing bounds their number, which is the user's
   choice to make.
