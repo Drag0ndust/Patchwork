@@ -488,7 +488,10 @@ export function App() {
       </div>
 
       {errors.length > 0 && (
-        <ul className="pw-errors">
+        // Labelled because the page has several lists (source roots, notices) and
+        // "the errors" has to be nameable — by a screen reader reaching it out of
+        // order, and by a test asserting on what the user was told.
+        <ul className="pw-errors" aria-label="Validation errors">
           {errors.map((err) => (
             <li key={err}>{err}</li>
           ))}
