@@ -169,6 +169,23 @@ describe("validateGraph — workflow name usable as a skill name", () => {
       ).toBe(true);
     },
   );
+
+  /**
+   * The check has to ask `slugify`, not a regex over the name as typed: the slug is
+   * derived from the *lowercased* name, and lowercasing can turn an unusable
+   * character into a usable one. `İ` (U+0130) is not `[a-z0-9]`, but it lowercases
+   * to `i` + U+0307 and so slugs to a perfectly good `i`.
+   */
+  it.each(["İ", "İİ", "  İ  "])(
+    "given_aNameUsableOnlyOnceLowercased_%s_whenValidating_thenAccepted",
+    (name) => {
+      const doc = linearDocument();
+      doc.workflow.name = name;
+
+      expect(slugify(name)).not.toBe("");
+      expect(validateGraph(doc).ok).toBe(true);
+    },
+  );
 });
 
 describe("validateGraph — the bundle directory name has to stay discoverable", () => {

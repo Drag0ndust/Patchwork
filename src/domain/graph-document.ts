@@ -131,11 +131,24 @@ export interface WorkflowMeta {
  * can expand a character — see the note on [`MAX_BUNDLE_DIR_LENGTH`].
  */
 export function slugify(name: string): string {
-  const slug = name
+  return rawSlug(name) || "workflow";
+}
+
+/**
+ * The slug before the fallback — empty exactly when the name has nothing to build a
+ * file name out of.
+ *
+ * Separate from [`slugify`] so `validateGraph` can tell "slugs to nothing" from "slugs
+ * to `workflow`" (a name that *is* `workflow` is fine) without re-deriving the rule.
+ * Asking this rather than testing the name against `[a-z0-9]` matters because the slug
+ * comes off the *lowercased* name, and lowercasing can make a character usable: `İ`
+ * (U+0130) is not `[a-z0-9]`, yet it slugs to `i`.
+ */
+function rawSlug(name: string): string {
+  return name
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
-  return slug || "workflow";
 }
 
 /** The longest single path component the common filesystems accept. */
@@ -258,7 +271,8 @@ export function validateGraph(doc: PatchworkDocument): ValidationResult {
   }
 
   const name = doc.workflow.name ?? "";
-  if (!/[a-z0-9]/i.test(name)) {
+  // The slug, not the name: lowercasing can make a character usable (see `rawSlug`).
+  if (rawSlug(name) === "") {
     errors.push(
       `Workflow name must contain at least one letter or digit usable in a file name ("${name}" produces an empty name)`,
     );
