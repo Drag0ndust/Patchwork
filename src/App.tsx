@@ -17,8 +17,9 @@ import {
   flowToDocument,
   type PatchNode,
 } from "./canvas/react-flow-adapter";
-import { compile } from "./domain/compiler";
+import { compile, vendorErrors } from "./domain/compiler";
 import {
+  DEFAULT_EXPORT_MODE,
   deserialize,
   serialize,
   validateGraph,
@@ -43,7 +44,7 @@ import {
   type AddRootOutcome,
   type SourceRoot,
 } from "./import/source-roots";
-import { NodeEditor } from "./editor/NodeEditor";
+import { NodeEditor, type NodeDataEdit } from "./editor/NodeEditor";
 import {
   exportBundle,
   pickDocumentToOpen,
@@ -72,8 +73,9 @@ function defaultData(type: NodeType): NodeData {
       return { description: "" };
     case "skill":
     case "agent":
-      // Bound to an artifact by the picker in the dock editor.
-      return { name: "", rootId: "" };
+      // Bound to an artifact by the picker in the dock editor. Reference-by-name
+      // until the user asks for a copy — see `DEFAULT_EXPORT_MODE`.
+      return { name: "", rootId: "", exportMode: DEFAULT_EXPORT_MODE };
   }
 }
 
@@ -144,6 +146,8 @@ export function App() {
   const [errors, setErrors] = useState<string[]>([]);
   const [sourceRoots, setSourceRoots] = useState<SourceRoot[]>(loadSourceRoots);
   const [catalog, setCatalog] = useState<ImportCatalog>(EMPTY_CATALOG);
+  const [exporting, setExporting] = useState(false);
+  const exportInFlight = useRef(false);
 
   const workflow: WorkflowMeta = useMemo(
     () => ({ name: workflowName, description: workflowDescription }),
@@ -289,13 +293,19 @@ export function App() {
   );
 
   const updateNode = useCallback(
-    (id: string, label: string, data: NodeData) => {
+    (id: string, label: string, data: NodeDataEdit) => {
       // Re-resolve so binding a reference clears (or sets) its unresolved flag.
       setNodes((ns) =>
         applyResolution(
-          ns.map((n) =>
-            n.id === id ? { ...n, data: { ...n.data, label, node: data } } : n,
-          ),
+          ns.map((n) => {
+            if (n.id !== id) return n;
+            // An editor may send an update instead of a value, to change one field
+            // without carrying a possibly-stale copy of the others — resolve it
+            // against the node as it is *now*, inside the functional update.
+            const node =
+              typeof data === "function" ? data(n.data.node) : data;
+            return { ...n, data: { ...n.data, label, node } };
+          }),
           catalogRef.current,
         ),
       );
@@ -338,6 +348,18 @@ export function App() {
   }, [setNodes, setEdges]);
 
   const handleExport = useCallback(async () => {
+    // One export at a time. Not for the bundle's sake — the Bundle Emitter stages
+    // and swaps, so overlapping exports cannot damage each other's output on disk
+    // (the loser's rename fails cleanly; see ADR-0002) — but for the sake of what
+    // this handler *reports*. Two exports in flight means two directory pickers and
+    // two status lines racing to describe one button press, and the user would have
+    // no way to tell which "Exported bundle to …" belongs to which click.
+    //
+    // Enforced on a ref rather than on `exporting`, because two clicks in one tick
+    // see the same rendered state.
+    if (exportInFlight.current) return;
+    exportInFlight.current = true;
+    setExporting(true);
     // Everything, validation included, runs inside the try: this handler is
     // async, so anything thrown outside it becomes an unhandled rejection and the
     // click appears to do nothing at all.
@@ -349,13 +371,30 @@ export function App() {
         setStatus("Cannot export: fix validation errors first.");
         return;
       }
+      // The bytes a vendor-copy node needs, captured once so the export writes
+      // exactly the artifacts that were just checked — a scan landing while the
+      // directory picker is open must not change what gets copied.
+      const artifacts = catalogRef.current.artifacts.map((a) => a.artifact);
+      const unvendorable = vendorErrors(doc, artifacts);
+      if (unvendorable.length > 0) {
+        setErrors(unvendorable);
+        setStatus(
+          "Cannot export: a node is set to copy an artifact that is not available right now.",
+        );
+        return;
+      }
       setErrors([]);
       const dir = await pickExportDirectory();
       if (!dir) return;
-      const written = await exportBundle(compile(doc), dir);
+      const written = await exportBundle(compile(doc, artifacts), dir);
       setStatus(`Exported bundle to ${written}`);
     } catch (e) {
       setStatus(`Export failed: ${String(e)}`);
+    } finally {
+      // Released on every path out — a cancelled picker, a validation refusal, or
+      // a failed write must not leave the button dead for the rest of the session.
+      exportInFlight.current = false;
+      setExporting(false);
     }
   }, [currentDocument]);
 
@@ -365,7 +404,10 @@ export function App() {
     ...catalog.problems,
     ...(unresolvedCount > 0
       ? [
-          `${unresolvedCount} node(s) reference an artifact that is not in any configured source root; they will still be referenced by name on export.`,
+          // The consequence differs per node now: naming an artifact never needs
+          // its bytes, copying one does — so a single sentence would be wrong for
+          // half of them.
+          `${unresolvedCount} node(s) reference an artifact that is not in any configured source root; reference-by-name nodes still export, while a node set to copy its artifact will refuse to.`,
         ]
       : []),
   ];
@@ -398,8 +440,8 @@ export function App() {
         <div className="pw-toolbar__group pw-toolbar__group--end">
           <button onClick={handleSave}>Save</button>
           <button onClick={handleLoad}>Load</button>
-          <button className="pw-primary" onClick={handleExport}>
-            Export
+          <button className="pw-primary" onClick={handleExport} disabled={exporting}>
+            {exporting ? "Exporting…" : "Export"}
           </button>
         </div>
       </header>
@@ -446,7 +488,10 @@ export function App() {
       </div>
 
       {errors.length > 0 && (
-        <ul className="pw-errors">
+        // Labelled because the page has several lists (source roots, notices) and
+        // "the errors" has to be nameable — by a screen reader reaching it out of
+        // order, and by a test asserting on what the user was told.
+        <ul className="pw-errors" aria-label="Validation errors">
           {errors.map((err) => (
             <li key={err}>{err}</li>
           ))}

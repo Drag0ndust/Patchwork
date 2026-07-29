@@ -19,3 +19,8 @@ pnpm-debug.log*
 *.local
 .vscode/*
 !.vscode/extensions.json
+
+# playwright
+playwright-report/
+test-results/
+.playwright-mcp/

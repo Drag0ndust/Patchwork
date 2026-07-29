@@ -1,0 +1,4 @@
+{
+  "name": "patchwork-vendor-mix",
+  "description": "Carry some dependencies along and reference the rest."
+}

@@ -6,13 +6,18 @@
  * canvas, but the document itself is the source of truth for compilation.
  */
 
-import { isValidArtifactName, type ArtifactKind } from "./artifact-codec";
+import {
+  isValidArtifactName,
+  MAX_NAME_SEGMENT_LENGTH,
+  type ArtifactKind,
+} from "./artifact-codec";
 
 /**
- * Bumped to 2 in slice 2: the palette grew `skill`/`agent` nodes that carry an
- * imported artifact reference. `deserialize` migrates older documents forward.
+ * Bumped to 3 in slice 3: a `skill`/`agent` node now records *how* it is
+ * exported — referenced by name, or vendor-copied into the bundle.
+ * `deserialize` migrates older documents forward.
  */
-export const CURRENT_SCHEMA_VERSION = 2;
+export const CURRENT_SCHEMA_VERSION = 3;
 
 /** The oldest document version that still opens (via forward migration). */
 export const MIN_SUPPORTED_SCHEMA_VERSION = 1;
@@ -55,6 +60,38 @@ export interface OutputData {
 export interface ArtifactRefData {
   name: string;
   rootId: string;
+  /**
+   * How the export treats this node. Optional on the *type* only so that a v2
+   * document and a hand-edited one are both readable without a repair step —
+   * every path that needs the value goes through [`exportModeOf`], and the UI
+   * always writes one.
+   */
+  exportMode?: ExportMode;
+}
+
+/**
+ * What an export does with a `skill`/`agent` node's artifact.
+ *
+ * - `reference` — name it in the umbrella's prose and copy nothing, so the
+ *   artifact must already be installed in Claude Code.
+ * - `vendor` — copy the artifact's bytes into the bundle, so the workflow
+ *   carries its dependency and runs on a machine that never had it.
+ */
+export type ExportMode = "reference" | "vendor";
+
+const EXPORT_MODES: ExportMode[] = ["reference", "vendor"];
+
+/**
+ * Reference-by-name is the default everywhere: it is what slice 2 did, so a
+ * document that predates the choice (or omits it) exports byte-identically to
+ * before, and the more surprising behaviour — copying someone else's file into a
+ * bundle — is never chosen on a user's behalf.
+ */
+export const DEFAULT_EXPORT_MODE: ExportMode = "reference";
+
+/** The export mode a `skill`/`agent` node's stored reference asks for. */
+export function exportModeOf(data: ArtifactRefData): ExportMode {
+  return data.exportMode ?? DEFAULT_EXPORT_MODE;
 }
 
 export type NodeData = InputData | PromptData | OutputData | ArtifactRefData;
@@ -82,6 +119,106 @@ export interface WorkflowMeta {
   name: string;
   description?: string;
 }
+
+/**
+ * Turn a workflow name into a filesystem/skill-safe slug. Falls back to
+ * `"workflow"` so `name`/`dirName` are never empty even for punctuation-only or
+ * non-ASCII names (validation rejects those at export; this is defence in depth).
+ *
+ * Lives here, beside the name it derives from, because both the Graph Compiler
+ * (which builds the bundle directory out of it) and `validateGraph` (which has to
+ * bound its *length*) need it, and the length is not the name's: `toLowerCase`
+ * can expand a character — see the note on [`MAX_BUNDLE_DIR_LENGTH`].
+ */
+export function slugify(name: string): string {
+  return rawSlug(name) || "workflow";
+}
+
+/**
+ * The slug before the fallback — empty exactly when the name has nothing to build a
+ * file name out of.
+ *
+ * Separate from [`slugify`] so `validateGraph` can tell "slugs to nothing" from "slugs
+ * to `workflow`" (a name that *is* `workflow` is fine) without re-deriving the rule.
+ * Asking this rather than testing the name against `[a-z0-9]` matters because the slug
+ * comes off the *lowercased* name, and lowercasing can make a character usable: `İ`
+ * (U+0130) is not `[a-z0-9]`, yet it slugs to `i`.
+ */
+function rawSlug(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/** The longest single path component the common filesystems accept. */
+const MAX_PATH_COMPONENT_LENGTH = 255;
+
+/**
+ * What the Bundle Emitter's own longest name adds to the bundle directory name.
+ *
+ * An export is written through a staging sibling and retires the previous bundle
+ * under a second one (`write_bundle`/`staging_name` in `src-tauri/src/lib.rs`), so
+ * the name that actually has to fit a path component is
+ * `.<dirName>.patchwork-previous-<pid>-<nanos>`:
+ *
+ * | part                  | worst case                        | chars |
+ * | --------------------- | --------------------------------- | ----- |
+ * | leading `.`           |                                   | 1     |
+ * | `.patchwork-`         |                                   | 11    |
+ * | role                  | `previous`                        | 8     |
+ * | `-` + process id      | a 32-bit pid                      | 11    |
+ * | `-` + epoch nanos     | 19 digits until the year 2286     | 20    |
+ */
+const EMITTER_NAME_COST = 1 + 11 + 8 + 11 + 20;
+
+/** The prefix `compile` puts in front of the slug to form the bundle directory. */
+export const BUNDLE_DIR_PREFIX = "patchwork-";
+
+/**
+ * What the *filesystem* allows the bundle directory to be called, once the room
+ * the Bundle Emitter's own temporary names need is taken out.
+ *
+ * Bounded here rather than left to the emitter because the failure otherwise
+ * surfaces at the far end of the export, as the operating system's "File name too
+ * long" naming a temporary directory the user has never seen and cannot connect to
+ * the name they typed.
+ */
+const MAX_BUNDLE_DIR_PATH_LENGTH = MAX_PATH_COMPONENT_LENGTH - EMITTER_NAME_COST;
+
+/**
+ * How long the exported bundle's directory name may be.
+ *
+ * Two independent bounds meet here, and the *smaller* is the rule:
+ *
+ * - the filesystem's, via [`MAX_BUNDLE_DIR_PATH_LENGTH`];
+ * - **discoverability's.** The bundle directory is not only a directory: dropped
+ *   into a source root it is the name Claude Code discovers the umbrella skill by,
+ *   and — when the bundle vendors anything — the plugin namespace every bundled
+ *   capability is invoked under (`patchwork-<slug>:tdd`). Both are *artifact name
+ *   segments*, so a directory the Import Scanner would reject is an export that
+ *   succeeds and then resolves to nothing. That is the binding one today, by a
+ *   wide margin.
+ *
+ * This — not the length of the name as typed — is the limit, because the one field
+ * that becomes a *filename* becomes it via `slugify`, and a slug is not the same
+ * length as its name in either direction:
+ *
+ * - **Longer.** `toLowerCase` can expand a character. `İ` (U+0130, on every Turkish
+ *   keyboard) becomes `i` + U+0307, and the combining mark is not `[a-z0-9]`, so
+ *   each one slugs to `i-`: a 29-character name can produce a 66-character
+ *   directory. It is the only such code point, and one is enough.
+ * - **Shorter.** 250 spaces slug to nothing at all, so a name-length rule would
+ *   refuse names that export perfectly well.
+ */
+export const MAX_BUNDLE_DIR_LENGTH = Math.min(
+  MAX_BUNDLE_DIR_PATH_LENGTH,
+  MAX_NAME_SEGMENT_LENGTH,
+);
+
+/** The longest name that is safe whatever it contains — for advice, not the rule. */
+export const MAX_WORKFLOW_NAME_LENGTH =
+  MAX_BUNDLE_DIR_LENGTH - BUNDLE_DIR_PREFIX.length;
 
 export interface PatchworkDocument {
   schemaVersion: number;
@@ -134,9 +271,17 @@ export function validateGraph(doc: PatchworkDocument): ValidationResult {
   }
 
   const name = doc.workflow.name ?? "";
-  if (!/[a-z0-9]/i.test(name)) {
+  // The slug, not the name: lowercasing can make a character usable (see `rawSlug`).
+  if (rawSlug(name) === "") {
     errors.push(
       `Workflow name must contain at least one letter or digit usable in a file name ("${name}" produces an empty name)`,
+    );
+  }
+  // The slug, not the name: they are not the same length (see MAX_BUNDLE_DIR_LENGTH).
+  const dirLength = BUNDLE_DIR_PREFIX.length + slugify(name).length;
+  if (dirLength > MAX_BUNDLE_DIR_LENGTH) {
+    errors.push(
+      `Workflow name is too long to export: it becomes the bundle directory '${BUNDLE_DIR_PREFIX}<slug>', which is also the name Claude Code discovers the exported skill by (and the namespace of anything bundled with it), so it must be at most ${MAX_BUNDLE_DIR_LENGTH} characters — this name produces ${dirLength}. Shorten it (up to ${MAX_WORKFLOW_NAME_LENGTH} characters is always safe).`,
     );
   }
 
@@ -403,17 +548,37 @@ export function deserialize(json: string): PatchworkDocument {
  * **Shape validation runs before migration**, against the *current* `NODE_TYPES`
  * and per-type `data` contracts. That holds only while every supported version's
  * node shapes are also valid under today's contracts — true for v1 -> v2, which
- * added node types without changing a field. The first migration that *renames or
- * retypes* a node's `data`, or retires a node type, would therefore see its input
- * rejected by validation before it could ever run: adding such a step means
- * moving `assertNodeShape`/`assertEdgeShape` after `migrateToCurrent` (and
- * hardening the migrations themselves against malformed input, which validation
- * currently spares them).
+ * added node types without changing a field, and still true for v2 -> v3, which
+ * adds `exportMode`: `assertNodeShape` accepts its *absence* (a v2 artifact
+ * reference is a valid v3 one) and only rejects a present-but-unknown value. The
+ * first migration that *renames or retypes* a node's `data`, or retires a node
+ * type, would therefore see its input rejected by validation before it could ever
+ * run: adding such a step means moving `assertNodeShape`/`assertEdgeShape` after
+ * `migrateToCurrent` (and hardening the migrations themselves against malformed
+ * input, which validation currently spares them).
  */
 const MIGRATIONS: Record<number, (doc: PatchworkDocument) => PatchworkDocument> = {
   // v1 -> v2: `skill`/`agent` nodes were added to the palette. No existing
   // field changed shape, so a v1 document is already a valid v2 document.
   1: (doc) => ({ ...doc, schemaVersion: 2 }),
+  // v2 -> v3: artifact references gained `exportMode`. Written out explicitly
+  // rather than left to `exportModeOf`'s default so that re-saving an opened v2
+  // document records the choice the user has been getting all along.
+  2: (doc) => ({
+    ...doc,
+    schemaVersion: 3,
+    nodes: doc.nodes.map((node) =>
+      artifactKindOf(node.type)
+        ? {
+            ...node,
+            data: {
+              ...(node.data as ArtifactRefData),
+              exportMode: exportModeOf(node.data as ArtifactRefData),
+            },
+          }
+        : node,
+    ),
+  }),
 };
 
 function migrateToCurrent(doc: PatchworkDocument): PatchworkDocument {
@@ -519,6 +684,18 @@ function assertNodeShape(raw: unknown, index: number): void {
       if (typeof data.rootId !== "string") {
         throw new Error(
           `${label} node '${id}' must have a string 'rootId' pointing at a configured source root`,
+        );
+      }
+      // Absent is fine — that is a v2 reference, and `exportModeOf` reads it as
+      // reference-by-name. An unknown value is not: silently treating it as one
+      // of the two modes would decide, on the user's behalf, whether someone
+      // else's file gets copied into their bundle.
+      if (
+        data.exportMode !== undefined &&
+        !EXPORT_MODES.includes(data.exportMode as ExportMode)
+      ) {
+        throw new Error(
+          `${label} node '${id}' has an invalid 'exportMode' '${String(data.exportMode)}' (expected one of ${EXPORT_MODES.join(", ")})`,
         );
       }
       break;

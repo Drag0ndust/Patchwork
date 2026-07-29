@@ -158,6 +158,41 @@ describe("parseArtifact/emitArtifact — round trip", () => {
     },
   );
 
+  it.each([
+    ["skill", "skills/tdd/SKILL.md", "tdd"],
+    ["skill", "skills/conventions/SKILL.md", "conventions"],
+    ["agent", "agents/pr-reviewer.md", "pr-reviewer"],
+    ["agent", "skills/coding/agents/pr-reviewer.md", "coding:pr-reviewer"],
+  ] as const)(
+    "given_%s_fixture_%s_whenEmittedAndReparsed_thenEveryFrontmatterFieldSurvives",
+    (kind, fixture, name) => {
+      // Vendor-copy re-emits what it parsed, so the fields Claude Code reads
+      // (`tools`, `model`, `effort`, ...) have to come back out of the copy —
+      // dropping one would silently change how the artifact runs.
+      const artifact = parseArtifact(kind, readFixture(fixture), name);
+
+      const reparsed = parseArtifact(kind, emitArtifact(artifact), name);
+
+      expect(reparsed.fields).toEqual(artifact.fields);
+      expect(reparsed.description).toBe(artifact.description);
+      expect(reparsed.body).toBe(artifact.body);
+    },
+  );
+
+  it("given_agentWithOptionalFields_whenEmitted_thenToolsModelAndEffortAreStillInTheFrontmatter", () => {
+    const artifact = parseArtifact(
+      "agent",
+      readFixture("agents/pr-reviewer.md"),
+      "pr-reviewer",
+    );
+
+    const emitted = emitArtifact(artifact);
+
+    expect(emitted).toContain("tools: Read, Grep, Glob, Bash");
+    expect(emitted).toContain("model: opus");
+    expect(emitted).toContain("effort: high");
+  });
+
   it("given_crlfArtifact_whenParsedAndEmitted_thenLineEndingsSurvive", () => {
     const source = "---\r\nname: crlf\r\ndescription: Windows file.\r\n---\r\n\r\nBody.\r\n";
 

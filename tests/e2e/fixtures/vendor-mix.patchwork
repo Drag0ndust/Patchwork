@@ -1,0 +1,74 @@
+{
+  "schemaVersion": 3,
+  "workflow": {
+    "name": "Vendor Mix",
+    "description": "Carry some dependencies along and reference the rest."
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "type": "input",
+      "label": "Task",
+      "data": { "parameters": [{ "name": "task", "description": "What to build." }] },
+      "position": { "x": 0, "y": 0 }
+    },
+    {
+      "id": "n2",
+      "type": "skill",
+      "label": "TDD",
+      "data": {
+        "name": "coding:tdd",
+        "rootId": "personal:~/.claude",
+        "exportMode": "vendor"
+      },
+      "position": { "x": 240, "y": 0 }
+    },
+    {
+      "id": "n3",
+      "type": "skill",
+      "label": "Conventions",
+      "data": {
+        "name": "conventions",
+        "rootId": "personal:~/.claude",
+        "exportMode": "reference"
+      },
+      "position": { "x": 480, "y": 0 }
+    },
+    {
+      "id": "n4",
+      "type": "agent",
+      "label": "Reviewer",
+      "data": {
+        "name": "coding:pr-reviewer",
+        "rootId": "personal:~/.claude",
+        "exportMode": "vendor"
+      },
+      "position": { "x": 720, "y": 0 }
+    },
+    {
+      "id": "n5",
+      "type": "agent",
+      "label": "Second reviewer",
+      "data": {
+        "name": "pr-reviewer",
+        "rootId": "personal:~/.claude",
+        "exportMode": "reference"
+      },
+      "position": { "x": 960, "y": 0 }
+    },
+    {
+      "id": "n6",
+      "type": "output",
+      "label": "Verdict",
+      "data": { "description": "The review digest." },
+      "position": { "x": 1200, "y": 0 }
+    }
+  ],
+  "edges": [
+    { "id": "e1", "source": "n1", "target": "n2" },
+    { "id": "e2", "source": "n2", "target": "n3" },
+    { "id": "e3", "source": "n3", "target": "n4" },
+    { "id": "e4", "source": "n4", "target": "n5" },
+    { "id": "e5", "source": "n5", "target": "n6" }
+  ]
+}

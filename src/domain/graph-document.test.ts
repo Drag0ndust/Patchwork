@@ -1,12 +1,19 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { isValidArtifactName } from "./artifact-codec";
 import {
+  BUNDLE_DIR_PREFIX,
   CURRENT_SCHEMA_VERSION,
+  MAX_BUNDLE_DIR_LENGTH,
+  MAX_WORKFLOW_NAME_LENGTH,
+  type ArtifactRefData,
   type InputData,
   type PatchworkDocument,
   deserialize,
+  exportModeOf,
   serialize,
+  slugify,
   validateGraph,
 } from "./graph-document";
 
@@ -162,6 +169,89 @@ describe("validateGraph — workflow name usable as a skill name", () => {
       ).toBe(true);
     },
   );
+
+  /**
+   * The check has to ask `slugify`, not a regex over the name as typed: the slug is
+   * derived from the *lowercased* name, and lowercasing can turn an unusable
+   * character into a usable one. `İ` (U+0130) is not `[a-z0-9]`, but it lowercases
+   * to `i` + U+0307 and so slugs to a perfectly good `i`.
+   */
+  it.each(["İ", "İİ", "  İ  "])(
+    "given_aNameUsableOnlyOnceLowercased_%s_whenValidating_thenAccepted",
+    (name) => {
+      const doc = linearDocument();
+      doc.workflow.name = name;
+
+      expect(slugify(name)).not.toBe("");
+      expect(validateGraph(doc).ok).toBe(true);
+    },
+  );
+});
+
+describe("validateGraph — the bundle directory name has to stay discoverable", () => {
+  function named(name: string): PatchworkDocument {
+    const doc = linearDocument();
+    doc.workflow.name = name;
+    return doc;
+  }
+
+  /**
+   * The rule is about the **slug**, not the name as typed, because the two do not
+   * have the same length in either direction.
+   *
+   * `İ` (U+0130, LATIN CAPITAL LETTER I WITH DOT ABOVE — on every Turkish
+   * keyboard) lowercases to *two* code units, `i` + U+0307, and the combining mark
+   * is not `[a-z0-9]`, so `slugify` turns each one into `i-`: the slug is twice the
+   * length of the name. Bounding the typed name would accept a 29-character name
+   * that produces a 66-character directory, which is the exact failure this bound
+   * exists to keep out of the export.
+   *
+   * It runs the other way too — 250 spaces slug to nothing — so a name-length rule
+   * would also refuse names that export perfectly well.
+   */
+  it.each([
+    ["at the limit in plain ASCII", "a".repeat(MAX_WORKFLOW_NAME_LENGTH), true],
+    ["one character past it", "a".repeat(MAX_WORKFLOW_NAME_LENGTH + 1), false],
+    ["short but slug-doubling (U+0130)", `a${"İ".repeat(100)}`, false],
+    ["the smallest slug-doubling overflow", `a${"İ".repeat(28)}`, false],
+    ["one İ short of it", `a${"İ".repeat(27)}`, true],
+    ["long but slugging to almost nothing", `a${" ".repeat(250)}`, true],
+  ])("given_aWorkflowName_%s_whenValidating_thenAcceptedIs_%s", (_case, name, ok) => {
+    expect(validateGraph(named(name)).ok).toBe(ok);
+  });
+
+  it("given_aSlugTooLongToExport_whenValidating_thenTheErrorNamesTheFieldAndBothLengths", () => {
+    const result = validateGraph(named(`a${"İ".repeat(28)}`));
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected failure");
+    expect(result.errors).toContain(
+      `Workflow name is too long to export: it becomes the bundle directory 'patchwork-<slug>', which is also the name Claude Code discovers the exported skill by (and the namespace of anything bundled with it), so it must be at most ${MAX_BUNDLE_DIR_LENGTH} characters — this name produces 66. Shorten it (up to ${MAX_WORKFLOW_NAME_LENGTH} characters is always safe).`,
+    );
+  });
+
+  it("given_theLongestExportableName_whenSlugged_thenTheBundleDirIsStillAnArtifactName", () => {
+    // The binding half of the bound: the bundle directory is the name the umbrella
+    // skill is discovered by and the namespace its vendored capabilities are
+    // invoked under, so a directory the codec would reject is an export that
+    // succeeds and then resolves to nothing.
+    const longest = `${BUNDLE_DIR_PREFIX}${slugify("a".repeat(MAX_WORKFLOW_NAME_LENGTH))}`;
+
+    expect(longest.length).toBe(MAX_BUNDLE_DIR_LENGTH);
+    expect(isValidArtifactName(longest)).toBe(true);
+    expect(isValidArtifactName(`${longest}x`)).toBe(false);
+  });
+
+  it("given_theLimit_whenComparedWithWhatTheEmitterAdds_thenAWholeStagingNameStillFits", () => {
+    // The other half: the emitter's longest name has to stay within a path
+    // component — `.<dirName>.patchwork-previous-<pid>-<nanos>`. Pinned from the Rust
+    // side too, against these very constants — see
+    // `given_the_staging_name_cost_then_it_matches_the_workflow_name_bound`.
+    const longestEmitterName = `.${"d".repeat(MAX_BUNDLE_DIR_LENGTH)}.patchwork-previous-${"9".repeat(10)}-${"9".repeat(19)}`;
+
+    expect(longestEmitterName.length).toBeLessThanOrEqual(255);
+    expect(MAX_WORKFLOW_NAME_LENGTH).toBe(MAX_BUNDLE_DIR_LENGTH - "patchwork-".length);
+  });
 });
 
 describe("validateGraph — linear-chain enforcement", () => {
@@ -606,6 +696,87 @@ describe("deserialize — forward migration", () => {
     const reserialized = serialize(deserialize(readFixture("schema-v1.patchwork")));
 
     expect(JSON.parse(reserialized).schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+  });
+});
+
+describe("export mode — the per-node vendor-copy vs reference-by-name choice", () => {
+  it("given_schemaV2Fixture_whenDeserializing_thenEveryArtifactRefDefaultsToReferenceByName", () => {
+    // The prior slice's behaviour: a document saved before the choice existed
+    // must keep exporting exactly as it did, i.e. nothing gets copied.
+    const migrated = deserialize(readFixture("schema-v2.patchwork"));
+
+    expect(migrated.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+    const modes = migrated.nodes
+      .filter((n) => n.type === "skill" || n.type === "agent")
+      .map((n) => (n.data as ArtifactRefData).exportMode);
+    expect(modes).toEqual(["reference", "reference"]);
+  });
+
+  it("given_schemaV2Fixture_whenMigrated_thenNothingElseAboutTheNodesChanges", () => {
+    const original = JSON.parse(
+      readFixture("schema-v2.patchwork"),
+    ) as PatchworkDocument;
+
+    const migrated = deserialize(readFixture("schema-v2.patchwork"));
+
+    expect(migrated.workflow).toEqual(original.workflow);
+    expect(migrated.edges).toEqual(original.edges);
+    expect(migrated.nodes.map((n) => [n.id, n.type, n.label, n.position])).toEqual(
+      original.nodes.map((n) => [n.id, n.type, n.label, n.position]),
+    );
+    expect(validateGraph(migrated)).toEqual({ ok: true });
+  });
+
+  it("given_vendorModeNodes_whenRoundTripped_thenTheChoiceSurvives", () => {
+    const doc = importedRefDocument();
+    doc.nodes[1].data = {
+      name: "coding:tdd",
+      rootId: "personal",
+      exportMode: "vendor",
+    };
+    doc.nodes[2].data = {
+      name: "pr-reviewer",
+      rootId: "project",
+      exportMode: "reference",
+    };
+
+    const restored = deserialize(serialize(doc));
+
+    expect(restored).toEqual(doc);
+    expect((restored.nodes[1].data as ArtifactRefData).exportMode).toBe("vendor");
+  });
+
+  it.each([
+    ["an unknown word", "copy"],
+    ["a boolean", true],
+    ["null", null],
+  ])(
+    "given_exportMode_that_is_%s_whenDeserializing_thenThrowsActionableErrorNamingTheNode",
+    (_case, exportMode) => {
+      const doc = importedRefDocument();
+      (doc.nodes[1].data as { exportMode: unknown }).exportMode = exportMode;
+
+      expect(() => deserialize(JSON.stringify(doc))).toThrow(
+        /Skill node 'n2' has an invalid 'exportMode'/,
+      );
+    },
+  );
+
+  it("given_handEditedCurrentVersionDocumentWithoutExportMode_whenDeserializing_thenItIsTolerated", () => {
+    // Absence is tolerated exactly the way the migration treats it, so a
+    // hand-written document does not have to spell out the default.
+    const doc = importedRefDocument();
+
+    const restored = deserialize(JSON.stringify(doc));
+
+    expect(exportModeOf(restored.nodes[1].data as ArtifactRefData)).toBe("reference");
+    expect(exportModeOf(restored.nodes[2].data as ArtifactRefData)).toBe("reference");
+  });
+
+  it("given_refDataWithAnExplicitMode_whenAskedForIt_thenTheStoredChoiceIsReturned", () => {
+    expect(
+      exportModeOf({ name: "tdd", rootId: "r", exportMode: "vendor" }),
+    ).toBe("vendor");
   });
 });
 

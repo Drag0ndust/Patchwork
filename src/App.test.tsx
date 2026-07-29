@@ -62,6 +62,26 @@ const DOCUMENT = JSON.stringify({
   ],
 });
 
+/** The same workflow, but its Skill node is set to vendor-copy `tdd`. */
+const VENDOR_DOCUMENT = JSON.stringify({
+  schemaVersion: 3,
+  workflow: { name: "Bound", description: "A saved workflow." },
+  nodes: [
+    { id: "n1", type: "input", label: "In", data: { parameters: [{ name: "topic" }] } },
+    {
+      id: "n2",
+      type: "skill",
+      label: "TDD",
+      data: { name: "tdd", rootId: "personal:~/.claude", exportMode: "vendor" },
+    },
+    { id: "n3", type: "output", label: "Out", data: { description: "the answer" } },
+  ],
+  edges: [
+    { id: "e1", source: "n1", target: "n2" },
+    { id: "e2", source: "n2", target: "n3" },
+  ],
+});
+
 beforeEach(() => {
   // Deterministic root configuration: every test starts from the default root.
   vi.stubGlobal("localStorage", {
@@ -184,6 +204,130 @@ describe("Export never fails into silence", () => {
       expect(screen.getByText(/Cannot export: fix validation errors first/)).toBeTruthy(),
     );
     expect(bridge.pickExportDirectory).not.toHaveBeenCalled();
+  });
+});
+
+describe("Exporting a vendor-copy node", () => {
+  it("given_aVendorModeNodeWhoseArtifactIsResolved_whenExported_thenItsBytesAreInTheBundle", async () => {
+    bridge.scanRoots.mockResolvedValue(reportWith([["skill", "tdd"]]));
+    bridge.readDocument.mockResolvedValue(VENDOR_DOCUMENT);
+    bridge.pickExportDirectory.mockResolvedValue("/out");
+    bridge.exportBundle.mockResolvedValue("/out/patchwork-bound");
+
+    render(<App />);
+    fireEvent.click(screen.getByText("Load"));
+    await waitFor(() => expect(screen.getByText(/Loaded/)).toBeTruthy());
+    fireEvent.click(screen.getByText("Export"));
+
+    await waitFor(() => expect(bridge.exportBundle).toHaveBeenCalled());
+    const [tree] = bridge.exportBundle.mock.calls[0] as [
+      { files: Array<{ path: string; contents: string }> },
+    ];
+    // Copies first, marker and umbrella last: a half-written bundle must not be
+    // discoverable (see `compile`).
+    expect(tree.files.map((f) => f.path)).toEqual([
+      "skills/tdd/SKILL.md",
+      ".claude-plugin/plugin.json",
+      "SKILL.md",
+    ]);
+    expect(tree.files[0].contents).toBe(
+      "---\nname: tdd\ndescription: An artifact.\n---\n\nBody.\n",
+    );
+  });
+
+  it("given_aVendorModeNodeWithNoResolvedArtifact_whenExported_thenItIsRefusedWithAReason", async () => {
+    // Bytes that are not there cannot be copied, and a bundle missing the copy it
+    // promises would fail later, inside Claude Code.
+    bridge.scanRoots.mockResolvedValue({ artifacts: [], problems: [] });
+    bridge.readDocument.mockResolvedValue(VENDOR_DOCUMENT);
+
+    render(<App />);
+    fireEvent.click(screen.getByText("Load"));
+    await waitFor(() => expect(screen.getByText(/Loaded/)).toBeTruthy());
+    fireEvent.click(screen.getByText("Export"));
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          /Skill node 'n2' is set to copy 'tdd' into the bundle, but that artifact is not in any configured source root/,
+        ),
+      ).toBeTruthy(),
+    );
+    expect(bridge.pickExportDirectory).not.toHaveBeenCalled();
+    expect(bridge.exportBundle).not.toHaveBeenCalled();
+  });
+});
+
+describe("Export is not re-entrant", () => {
+  /**
+   * `write_bundle` clears the destination and then writes the files one by one, so
+   * two exports of the same workflow interleave: the second one's `remove_dir_all`
+   * can land between the first one's writes, and the first would still report
+   * success — for a bundle now missing a vendored dependency. The window is N files
+   * wide since vendor-copy, so the renderer must not open it at all.
+   */
+  it("given_exportInFlight_whenTheButtonIsClickedAgain_thenOnlyOneExportRuns", async () => {
+    const pick = deferred<string | null>();
+    bridge.scanRoots.mockResolvedValue(reportWith([["skill", "tdd"]]));
+    bridge.readDocument.mockResolvedValue(VENDOR_DOCUMENT);
+    bridge.pickExportDirectory.mockReturnValue(pick.promise);
+    bridge.exportBundle.mockResolvedValue("/out/patchwork-bound");
+
+    render(<App />);
+    fireEvent.click(screen.getByText("Load"));
+    await waitFor(() => expect(screen.getByText(/Loaded/)).toBeTruthy());
+
+    const button = screen.getByText("Export");
+    fireEvent.click(button);
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    await waitFor(() => expect(bridge.pickExportDirectory).toHaveBeenCalledTimes(1));
+    pick.resolve("/out");
+    await waitFor(() => expect(screen.getByText(/Exported bundle to/)).toBeTruthy());
+    expect(bridge.exportBundle).toHaveBeenCalledTimes(1);
+  });
+
+  it("given_exportInFlight_whenRendered_thenTheButtonSaysSoAndIsDisabled", async () => {
+    const pick = deferred<string | null>();
+    bridge.scanRoots.mockResolvedValue(reportWith([["skill", "tdd"]]));
+    bridge.readDocument.mockResolvedValue(VENDOR_DOCUMENT);
+    bridge.pickExportDirectory.mockReturnValue(pick.promise);
+    bridge.exportBundle.mockResolvedValue("/out/patchwork-bound");
+
+    render(<App />);
+    fireEvent.click(screen.getByText("Load"));
+    await waitFor(() => expect(screen.getByText(/Loaded/)).toBeTruthy());
+    fireEvent.click(screen.getByText("Export"));
+
+    const button = await waitFor(
+      () => screen.getByText("Exporting…") as HTMLButtonElement,
+    );
+    expect(button.disabled).toBe(true);
+
+    pick.resolve("/out");
+    await waitFor(() => expect(screen.getByText("Export")).toBeTruthy());
+  });
+
+  it("given_anExportThatFailed_whenClickedAgain_thenTheButtonIsUsableAgain", async () => {
+    bridge.scanRoots.mockResolvedValue(reportWith([["skill", "tdd"]]));
+    bridge.readDocument.mockResolvedValue(VENDOR_DOCUMENT);
+    bridge.pickExportDirectory.mockResolvedValue("/out");
+    bridge.exportBundle.mockRejectedValueOnce(new Error("disk full"));
+
+    render(<App />);
+    fireEvent.click(screen.getByText("Load"));
+    await waitFor(() => expect(screen.getByText(/Loaded/)).toBeTruthy());
+    fireEvent.click(screen.getByText("Export"));
+    await waitFor(() => expect(screen.getByText(/Export failed:.*disk full/)).toBeTruthy());
+
+    // A failed export must not leave the button dead — the guard has to be
+    // released on every path out, not just the happy one.
+    bridge.exportBundle.mockResolvedValue("/out/patchwork-bound");
+    fireEvent.click(screen.getByText("Export"));
+
+    await waitFor(() => expect(screen.getByText(/Exported bundle to/)).toBeTruthy());
+    expect(bridge.exportBundle).toHaveBeenCalledTimes(2);
   });
 });
 

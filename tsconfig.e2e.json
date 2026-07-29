@@ -1,0 +1,26 @@
+{
+  // The end-to-end suite is typechecked, and deliberately against the app's own
+  // types: the fake backend in `tests/e2e/tauri-stub.ts` imports `ScanReport` and
+  // `BundleTree` from `src/`, so a change to what the Rust half returns breaks this
+  // compile instead of drifting quietly into a fake that answers last year's shape.
+  //
+  // Separate from `tsconfig.json` because that one includes only `src` and is the
+  // config `vite build` runs, and Playwright transpiles specs itself without
+  // consulting either.
+  "compilerOptions": {
+    "target": "ES2021",
+    "lib": ["ES2021", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["tests/e2e/**/*.ts", "playwright.config.ts"]
+}
