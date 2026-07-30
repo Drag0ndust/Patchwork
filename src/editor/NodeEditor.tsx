@@ -1,7 +1,12 @@
 import {
   artifactKindOf,
+  branchesWithinLimit,
   exportModeOf,
+  MAX_BRANCHES_PER_CONDITIONAL,
+  MIN_BRANCHES_PER_CONDITIONAL,
   type ArtifactRefData,
+  type Branch,
+  type ConditionalData,
   type ExportMode,
   type InputData,
   type NodeData,
@@ -9,6 +14,7 @@ import {
   type OutputData,
   type PromptData,
 } from "../domain/graph-document";
+import { newId } from "../domain/ids";
 import type { ArtifactKind } from "../domain/artifact-codec";
 import {
   catalogArtifactsOfKind,
@@ -40,6 +46,7 @@ const TYPE_LABEL: Record<NodeType, string> = {
   output: "Output",
   skill: "Skill",
   agent: "Agent",
+  conditional: "Conditional",
 };
 
 export function NodeEditor({ node, catalog, onChange }: NodeEditorProps) {
@@ -86,6 +93,12 @@ export function NodeEditor({ node, catalog, onChange }: NodeEditorProps) {
         <OutputFields
           data={data as OutputData}
           onChange={(d) => emit(label, d)}
+        />
+      )}
+      {type === "conditional" && (
+        <ConditionalFields
+          data={data as ConditionalData}
+          onChange={(d) => emit(label, (current) => d(current as ConditionalData))}
         />
       )}
       {artifactKindOf(type) && (
@@ -205,6 +218,146 @@ function ArtifactPicker({
               : `'${data.name}' is not in any configured source root right now. Re-point it or restore the root; the reference is kept either way.`}
           </p>
         )}
+      </div>
+    </>
+  );
+}
+
+/**
+ * Edit an LLM conditional: the question the executing model has to answer, and the
+ * branches it chooses between.
+ *
+ * Every edit is sent as an **update** over the node's current data, for the reason the
+ * artifact picker is: the question and the branch list are separate controls over one
+ * object, and rebuilding it from the rendered props would let two edits landing in the
+ * same tick overwrite each other.
+ *
+ * Adding a branch mints a fresh id and leaves the label empty rather than inventing
+ * one: a placeholder label would be a branch the exported prose asks the model to
+ * choose by a name the user never wrote, and `validateGraph` names the empty label.
+ */
+function ConditionalFields({
+  data,
+  onChange,
+}: {
+  data: ConditionalData;
+  onChange: (edit: (current: ConditionalData) => ConditionalData) => void;
+}) {
+  const branches = Array.isArray(data.branches) ? data.branches : [];
+  /** Rewrite the branch list, leaving every other field of the data as it is. */
+  const editBranches = (rewrite: (current: Branch[]) => Branch[]) =>
+    onChange((current) => ({
+      ...current,
+      branches: rewrite(Array.isArray(current.branches) ? current.branches : []),
+    }));
+
+  // Both bounds are stated rather than only enforced: a control that stops working without
+  // saying why leaves the user guessing at a number they cannot see. The count sits in the
+  // field's own label, and the *reason* appears only at a bound — in a `role="status"`
+  // region, so it is announced when the limit is reached instead of being discovered as a
+  // dead button, and so nothing is announced while there is nothing to say.
+  const atCeiling = branches.length >= MAX_BRANCHES_PER_CONDITIONAL;
+  const atFloor = branches.length <= MIN_BRANCHES_PER_CONDITIONAL;
+  const ceilingReason = `At the limit of ${MAX_BRANCHES_PER_CONDITIONAL} branches. Remove one, or branch again inside a branch.`;
+  const floorReason =
+    "A conditional offers a choice, so it keeps at least two branches.";
+
+  // A document can be *opened* over the limit — `deserialize` keeps every branch and
+  // `validateGraph` refuses the export (ADR-0003) — so the dock has the same job the canvas
+  // has: bound what it draws, say what is wrong, and offer the way out. Rendering thousands of
+  // text inputs would freeze selecting the node, which is one click from the canvas.
+  const excess = branches.length - MAX_BRANCHES_PER_CONDITIONAL;
+  const overWidth = excess > 0;
+  const shown = branchesWithinLimit(branches);
+  const overWidthReason = `${branches.length} branches, over the limit of ${MAX_BRANCHES_PER_CONDITIONAL}. The first ${MAX_BRANCHES_PER_CONDITIONAL} are shown; the export is refused until the rest are removed.`;
+
+  return (
+    <>
+      <label className="pw-field pw-field--grow">
+        <span>Decision question</span>
+        <textarea
+          value={data.question}
+          onChange={(e) => {
+            // Read out of the event *before* the updater, which runs later: the
+            // control is controlled, so by then the DOM value has been set back to
+            // the prop and the edit would read as a no-op.
+            const question = e.target.value;
+            onChange((current) => ({ ...current, question }));
+          }}
+          placeholder="e.g. Does the report contain a stack trace?"
+        />
+      </label>
+      <div className="pw-field pw-field--grow">
+        <span>
+          Branches ({branches.length} of {MAX_BRANCHES_PER_CONDITIONAL})
+        </span>
+        <ul className="pw-branches">
+          {shown.map((branch, index) => (
+            <li key={branch.id} className="pw-branches__item">
+              <input
+                // Numbered, not named by the label: the label is what is being
+                // edited, so it cannot also be the handle used to find the field.
+                aria-label={`Branch ${index + 1} label`}
+                value={branch.label}
+                onChange={(e) => {
+                  // Captured eagerly, as with the question above.
+                  const label = e.target.value;
+                  editBranches((current) =>
+                    current.map((b) => (b.id === branch.id ? { ...b, label } : b)),
+                  );
+                }}
+                placeholder="e.g. with trace"
+              />
+              <button
+                aria-label={`Remove branch ${branch.label.trim() || branch.id}`}
+                // Two is the floor: fewer is not a choice, and the export refuses it.
+                title={atFloor ? floorReason : undefined}
+                disabled={atFloor}
+                onClick={() =>
+                  editBranches((current) => current.filter((b) => b.id !== branch.id))
+                }
+              >
+                ✕
+              </button>
+            </li>
+          ))}
+        </ul>
+        <button
+          aria-label="Add branch"
+          // The ceiling, as the two-branch floor is a ceiling from below: past it
+          // `validateGraph` refuses the document and the canvas draws more source handles
+          // than it can draw responsively, so the edit is not offered — and the reason is
+          // both on the control and in the status line below it.
+          title={atCeiling ? ceilingReason : undefined}
+          disabled={atCeiling}
+          onClick={() =>
+            editBranches((current) => [...current, { id: newId("branch"), label: "" }])
+          }
+        >
+          ＋ Branch
+        </button>
+        {overWidth && (
+          <button
+            aria-label={`Remove the ${excess} branches past the limit`}
+            // Recovery in the app rather than in a text editor: removing rows one at a time
+            // would be thousands of clicks on a generated document. It says exactly how many
+            // it removes and touches nothing else, so the loss is the user's choice.
+            onClick={() =>
+              editBranches((current) => current.slice(0, MAX_BRANCHES_PER_CONDITIONAL))
+            }
+          >
+            Remove the {excess} past the limit
+          </button>
+        )}
+        {(overWidth || atCeiling || atFloor) && (
+          <p className="pw-ref pw-ref--unresolved" role="status">
+            {overWidth ? overWidthReason : atCeiling ? ceilingReason : floorReason}
+          </p>
+        )}
+        <p className="pw-ref">
+          Claude Code answers the question above at run time and follows the one branch
+          it picks. Wire each branch from its own handle on the node.
+        </p>
       </div>
     </>
   );

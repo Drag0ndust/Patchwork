@@ -1,0 +1,148 @@
+{
+  "schemaVersion": 4,
+  "workflow": {
+    "name": "Triage Report",
+    "description": "Triage a bug report along the path its contents call for."
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "type": "input",
+      "label": "Report",
+      "data": {
+        "parameters": [
+          {
+            "name": "report",
+            "description": "The raw bug report."
+          }
+        ]
+      },
+      "position": {
+        "x": 40,
+        "y": 200
+      }
+    },
+    {
+      "id": "n2",
+      "type": "prompt",
+      "label": "Assess",
+      "data": {
+        "instruction": "Read {report} and list what it does and does not contain."
+      },
+      "position": {
+        "x": 300,
+        "y": 200
+      }
+    },
+    {
+      "id": "c1",
+      "type": "conditional",
+      "label": "Has a stack trace?",
+      "data": {
+        "mode": "llm",
+        "question": "Does the report contain a stack trace?",
+        "branches": [
+          {
+            "id": "b1",
+            "label": "with trace"
+          },
+          {
+            "id": "b2",
+            "label": "no trace"
+          }
+        ]
+      },
+      "position": {
+        "x": 560,
+        "y": 180
+      }
+    },
+    {
+      "id": "n3",
+      "type": "prompt",
+      "label": "Extract frame",
+      "data": {
+        "instruction": "Name the failing frame in the stack trace."
+      },
+      "position": {
+        "x": 840,
+        "y": 100
+      }
+    },
+    {
+      "id": "n4",
+      "type": "prompt",
+      "label": "Ask reporter",
+      "data": {
+        "instruction": "List the reproduction details the reporter must add."
+      },
+      "position": {
+        "x": 840,
+        "y": 300
+      }
+    },
+    {
+      "id": "n5",
+      "type": "prompt",
+      "label": "Summarize",
+      "data": {
+        "instruction": "Write the triage summary."
+      },
+      "position": {
+        "x": 1120,
+        "y": 200
+      }
+    },
+    {
+      "id": "n6",
+      "type": "output",
+      "label": "Triage",
+      "data": {
+        "description": "The triage summary."
+      },
+      "position": {
+        "x": 1380,
+        "y": 200
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "source": "n1",
+      "target": "n2"
+    },
+    {
+      "id": "e2",
+      "source": "n2",
+      "target": "c1"
+    },
+    {
+      "id": "e3",
+      "source": "c1",
+      "target": "n3",
+      "branch": "b1"
+    },
+    {
+      "id": "e4",
+      "source": "c1",
+      "target": "n4",
+      "branch": "b2"
+    },
+    {
+      "id": "e5",
+      "source": "n3",
+      "target": "n5"
+    },
+    {
+      "id": "e6",
+      "source": "n4",
+      "target": "n5"
+    },
+    {
+      "id": "e7",
+      "source": "n5",
+      "target": "n6"
+    }
+  ]
+}

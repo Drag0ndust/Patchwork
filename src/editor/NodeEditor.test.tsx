@@ -2,7 +2,12 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { PatchNode } from "../canvas/react-flow-adapter";
-import type { ExportMode, NodeData } from "../domain/graph-document";
+import {
+  branchesWithinLimit,
+  MAX_BRANCHES_PER_CONDITIONAL,
+  type ExportMode,
+  type NodeData,
+} from "../domain/graph-document";
 import { buildCatalog, type ImportCatalog } from "../import/catalog";
 import type { SourceRoot } from "../import/source-roots";
 import { NodeEditor } from "./NodeEditor";
@@ -278,5 +283,298 @@ describe("NodeEditor — unbinding", () => {
       rootId: "personal:~/.claude",
       exportMode: "reference",
     });
+  });
+});
+
+function conditionalNode(branches?: Array<{ id: string; label: string }>): PatchNode {
+  return {
+    id: "c1",
+    type: "conditional",
+    position: { x: 0, y: 0 },
+    data: {
+      label: "Has a stack trace?",
+      node: {
+        mode: "llm",
+        question: "Does the report contain a stack trace?",
+        branches: branches ?? [
+          { id: "b1", label: "with trace" },
+          { id: "b2", label: "no trace" },
+        ],
+      },
+    },
+  };
+}
+
+describe("NodeEditor — a Conditional node's branches", () => {
+  it("given_aConditionalNode_whenRendered_thenItIsNamedAsOne", () => {
+    render(<NodeEditor node={conditionalNode()} catalog={catalog()} onChange={vi.fn()} />);
+
+    expect(screen.getByText("Conditional node")).toBeTruthy();
+  });
+
+  it("given_aConditionalNode_whenRendered_thenEveryBranchLabelIsEditable", () => {
+    render(<NodeEditor node={conditionalNode()} catalog={catalog()} onChange={vi.fn()} />);
+
+    expect((screen.getByLabelText("Branch 1 label") as HTMLInputElement).value).toBe(
+      "with trace",
+    );
+    expect((screen.getByLabelText("Branch 2 label") as HTMLInputElement).value).toBe(
+      "no trace",
+    );
+  });
+
+  it("given_aConditionalNode_whenTheQuestionIsEdited_thenTheBranchesAreLeftAlone", () => {
+    const onChange = vi.fn();
+    render(<NodeEditor node={conditionalNode()} catalog={catalog()} onChange={onChange} />);
+
+    fireEvent.change(screen.getByLabelText("Decision question"), {
+      target: { value: "Is it a crash?" },
+    });
+
+    expect(applied(onChange.mock.calls[0][2], conditionalNode().data.node)).toEqual({
+      mode: "llm",
+      question: "Is it a crash?",
+      branches: [
+        { id: "b1", label: "with trace" },
+        { id: "b2", label: "no trace" },
+      ],
+    });
+  });
+
+  it("given_aBranch_whenRelabelled_thenItsIdIsUnchanged", () => {
+    // The id is what edges are attached by, so renaming a branch must not re-key it:
+    // that is the whole reason the label and the id are separate fields (ADR-0003).
+    const onChange = vi.fn();
+    render(<NodeEditor node={conditionalNode()} catalog={catalog()} onChange={onChange} />);
+
+    fireEvent.change(screen.getByLabelText("Branch 2 label"), {
+      target: { value: "needs a trace" },
+    });
+
+    expect(applied(onChange.mock.calls[0][2], conditionalNode().data.node)).toEqual({
+      mode: "llm",
+      question: "Does the report contain a stack trace?",
+      branches: [
+        { id: "b1", label: "with trace" },
+        { id: "b2", label: "needs a trace" },
+      ],
+    });
+  });
+
+  it("given_aConditionalNode_whenABranchIsAdded_thenItGetsAFreshIdAndAnEmptyLabel", () => {
+    const onChange = vi.fn();
+    render(<NodeEditor node={conditionalNode()} catalog={catalog()} onChange={onChange} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Add branch" }));
+
+    const data = applied(
+      onChange.mock.calls[0][2],
+      conditionalNode().data.node,
+    ) as { branches: Array<{ id: string; label: string }> };
+    expect(data.branches).toHaveLength(3);
+    expect(data.branches[2].label).toBe("");
+    expect(new Set(data.branches.map((b) => b.id)).size).toBe(3);
+  });
+
+  it("given_threeBranches_whenOneIsRemoved_thenOnlyThatOneGoes", () => {
+    const onChange = vi.fn();
+    const node = conditionalNode([
+      { id: "b1", label: "with trace" },
+      { id: "b2", label: "no trace" },
+      { id: "b3", label: "not a bug" },
+    ]);
+    render(<NodeEditor node={node} catalog={catalog()} onChange={onChange} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove branch no trace" }));
+
+    expect(applied(onChange.mock.calls[0][2], node.data.node)).toEqual({
+      mode: "llm",
+      question: "Does the report contain a stack trace?",
+      branches: [
+        { id: "b1", label: "with trace" },
+        { id: "b3", label: "not a bug" },
+      ],
+    });
+  });
+
+  it("given_twoBranches_whenRendered_thenNeitherCanBeRemoved", () => {
+    // A choice between one thing is not a choice, and `validateGraph` refuses it — so
+    // the editor does not offer the edit that would produce it.
+    render(<NodeEditor node={conditionalNode()} catalog={catalog()} onChange={vi.fn()} />);
+
+    expect(
+      (screen.getByRole("button", { name: "Remove branch no trace" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+  });
+});
+
+describe("NodeEditor — the branch limit", () => {
+  it("given_aConditionalAtTheBranchLimit_whenRendered_thenNoFurtherBranchIsOffered", () => {
+    // The same courtesy the two-branch floor gets: the editor does not offer the edit that
+    // would produce a document `validateGraph` refuses — and past the limit the canvas would
+    // be drawing more source handles than it can draw responsively, so the button is the
+    // cheapest place to stop.
+    const node = conditionalNode(
+      Array.from({ length: MAX_BRANCHES_PER_CONDITIONAL }, (_, at) => ({
+        id: `b${at}`,
+        label: `branch ${at}`,
+      })),
+    );
+    render(<NodeEditor node={node} catalog={catalog()} onChange={vi.fn()} />);
+
+    expect(
+      (screen.getByRole("button", { name: "Add branch" }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("given_aConditionalOneBranchBelowTheLimit_whenRendered_thenAnotherBranchIsStillOffered", () => {
+    const node = conditionalNode(
+      Array.from({ length: MAX_BRANCHES_PER_CONDITIONAL - 1 }, (_, at) => ({
+        id: `b${at}`,
+        label: `branch ${at}`,
+      })),
+    );
+    render(<NodeEditor node={node} catalog={catalog()} onChange={vi.fn()} />);
+
+    expect(
+      (screen.getByRole("button", { name: "Add branch" }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+  });
+});
+
+describe("NodeEditor — the branch limits are stated, not just enforced", () => {
+  function branchesFor(count: number) {
+    return Array.from({ length: count }, (_, at) => ({ id: `b${at}`, label: `branch ${at}` }));
+  }
+
+  it("given_aConditional_whenRendered_thenTheBranchCountAndItsCeilingAreVisible", () => {
+    render(
+      <NodeEditor node={conditionalNode(branchesFor(3))} catalog={catalog()} onChange={vi.fn()} />,
+    );
+
+    expect(screen.getByText(`Branches (3 of ${MAX_BRANCHES_PER_CONDITIONAL})`)).toBeTruthy();
+  });
+
+  it("given_aConditionalAtTheBranchLimit_whenRendered_thenTheReasonIsStatedAndNotOnlyDisabled", () => {
+    // A control that stops working without saying why is the defect: the number and the way
+    // out both have to be on screen. `role="status"` so a screen reader hears it when the
+    // limit is reached rather than discovering a dead button.
+    render(
+      <NodeEditor
+        node={conditionalNode(branchesFor(MAX_BRANCHES_PER_CONDITIONAL))}
+        catalog={catalog()}
+        onChange={vi.fn()}
+      />,
+    );
+
+    const add = screen.getByRole("button", { name: "Add branch" }) as HTMLButtonElement;
+    expect(add.disabled).toBe(true);
+    expect(add.title).toContain(`${MAX_BRANCHES_PER_CONDITIONAL}`);
+    expect(screen.getByRole("status").textContent).toBe(
+      `At the limit of ${MAX_BRANCHES_PER_CONDITIONAL} branches. Remove one, or branch again inside a branch.`,
+    );
+  });
+
+  it("given_aConditionalAtTheTwoBranchFloor_whenRendered_thenThatReasonIsStatedToo", () => {
+    // The floor was enforced the same silent way. Same treatment.
+    render(
+      <NodeEditor node={conditionalNode(branchesFor(2))} catalog={catalog()} onChange={vi.fn()} />,
+    );
+
+    const remove = screen.getByRole("button", {
+      name: "Remove branch branch 1",
+    }) as HTMLButtonElement;
+    expect(remove.disabled).toBe(true);
+    expect(remove.title).toContain("two");
+    expect(screen.getByRole("status").textContent).toBe(
+      "A conditional offers a choice, so it keeps at least two branches.",
+    );
+  });
+
+  it("given_aConditionalBetweenTheLimits_whenRendered_thenNothingIsAnnounced", () => {
+    render(
+      <NodeEditor node={conditionalNode(branchesFor(4))} catalog={catalog()} onChange={vi.fn()} />,
+    );
+
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+});
+
+describe("NodeEditor — a conditional that was opened over the limit", () => {
+  function branchesFor(count: number) {
+    return Array.from({ length: count }, (_, at) => ({ id: `b${at}`, label: `branch ${at}` }));
+  }
+
+  const OVER = MAX_BRANCHES_PER_CONDITIONAL + 36;
+
+  it("given_aConditionalOverTheLimit_whenRendered_thenOnlyTheLimitsWorthOfRowsIsShown", () => {
+    // The dock is one click from the canvas, so it needs the same bound the canvas has: a
+    // document may be *opened* over the limit, and rendering thousands of inputs would freeze
+    // selecting the node.
+    render(
+      <NodeEditor node={conditionalNode(branchesFor(OVER))} catalog={catalog()} onChange={vi.fn()} />,
+    );
+
+    expect(screen.getAllByLabelText(/^Branch \d+ label$/)).toHaveLength(
+      MAX_BRANCHES_PER_CONDITIONAL,
+    );
+  });
+
+  it("given_aConditionalOverTheLimit_whenRendered_thenTheRowsShownAreTheOnesEveryOtherSurfaceShows", () => {
+    // The dock's half of the three-way agreement: the same definition the canvas node and the
+    // edge filter use. See the companion assertions in `canvas/nodes.test.tsx` and
+    // `canvas/react-flow-adapter.test.ts`.
+    const branches = branchesFor(OVER);
+    render(
+      <NodeEditor node={conditionalNode(branches)} catalog={catalog()} onChange={vi.fn()} />,
+    );
+
+    const rows = screen
+      .getAllByLabelText(/^Branch \d+ label$/)
+      .map((input) => (input as HTMLInputElement).value);
+    expect(rows).toEqual(branchesWithinLimit(branches).map((branch) => branch.label));
+  });
+
+  it("given_aConditionalOverTheLimit_whenRendered_thenItSaysWhatIsWrongAndWhatIsHidden", () => {
+    render(
+      <NodeEditor node={conditionalNode(branchesFor(OVER))} catalog={catalog()} onChange={vi.fn()} />,
+    );
+
+    expect(screen.getByRole("status").textContent).toBe(
+      `${OVER} branches, over the limit of ${MAX_BRANCHES_PER_CONDITIONAL}. The first ${MAX_BRANCHES_PER_CONDITIONAL} are shown; the export is refused until the rest are removed.`,
+    );
+  });
+
+  it("given_aConditionalOverTheLimit_whenTheOfferedRepairIsTaken_thenExactlyTheExcessIsRemoved", () => {
+    // Recovery has to be possible *in the app*: deleting rows one at a time would take 36
+    // clicks here and thousands on a generated document. The button says exactly how many
+    // branches it removes, and removes nothing else — the user chooses the loss.
+    const onChange = vi.fn();
+    const node = conditionalNode(branchesFor(OVER));
+    render(<NodeEditor node={node} catalog={catalog()} onChange={onChange} />);
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: `Remove the ${OVER - MAX_BRANCHES_PER_CONDITIONAL} branches past the limit`,
+      }),
+    );
+
+    const data = applied(onChange.mock.calls[0][2], node.data.node) as {
+      branches: Array<{ id: string }>;
+    };
+    expect(data.branches).toHaveLength(MAX_BRANCHES_PER_CONDITIONAL);
+    expect(data.branches[0].id).toBe("b0");
+    expect(data.branches[MAX_BRANCHES_PER_CONDITIONAL - 1].id).toBe(
+      `b${MAX_BRANCHES_PER_CONDITIONAL - 1}`,
+    );
+  });
+
+  it("given_aConditionalWithinTheLimit_whenRendered_thenNoRepairIsOffered", () => {
+    render(
+      <NodeEditor node={conditionalNode(branchesFor(4))} catalog={catalog()} onChange={vi.fn()} />,
+    );
+
+    expect(screen.queryByRole("button", { name: /branches past the limit/ })).toBeNull();
   });
 });
