@@ -2,8 +2,9 @@
 
 Design AI Workflows.
 
-Patchwork is a Tauri desktop app for composing linear AI workflows on a visual
-canvas and exporting them as runnable Claude Code skill bundles.
+Patchwork is a Tauri desktop app for composing AI workflows on a visual canvas —
+linear chains, and branches an LLM chooses between at run time — and exporting them
+as runnable Claude Code skill bundles.
 
 ## Stack
 
@@ -17,10 +18,15 @@ canvas and exporting them as runnable Claude Code skill bundles.
 - **Graph Document** (`src/domain/graph-document.ts`) — the `.patchwork` schema,
   `validateGraph`, and `serialize`/`deserialize`. Patchwork's own format, not a
   raw React Flow dump.
+- **Workflow Order** (`src/domain/workflow-order.ts`) — pure `planWorkflow(doc)`:
+  the order a workflow runs in, as segments where a `Conditional` fans out into
+  labelled branches and back together again. Shared by the compiler (which renders
+  it) and `validateGraph` (which asks it whether the graph can be followed).
 - **Graph Compiler** (`src/domain/compiler.ts`) — pure `compile(doc)` producing
   an in-memory `BundleTree` (no IO). Emits an umbrella `SKILL.md` whose prose
-  encodes the linear Input → step(s) → Output order. Imported `Skill`/`Agent`
-  nodes are emitted as **reference-by-name** (the artifact is not copied).
+  encodes the Input → step(s) → Output order, including the branch instructions an
+  LLM `Conditional` is decided by (ADR-0003). Imported `Skill`/`Agent` nodes are
+  emitted as **reference-by-name** (the artifact is not copied).
 - **Artifact Codec** (`src/domain/artifact-codec.ts`) — pure parse/emit for the
   two on-disk formats, and the one place that knows a skill is a *directory*
   containing `SKILL.md` while an agent is a *single file* `agents/<name>.md`.

@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 3,
+  "workflow": {
+    "name": "Review Change",
+    "description": "Implement a change test-first, then review it."
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "type": "input",
+      "label": "Task",
+      "data": {
+        "parameters": [
+          {
+            "name": "task",
+            "description": "What to build."
+          }
+        ]
+      },
+      "position": {
+        "x": 120,
+        "y": 120
+      }
+    },
+    {
+      "id": "n2",
+      "type": "skill",
+      "label": "TDD",
+      "data": {
+        "name": "coding:tdd",
+        "rootId": "personal:~/.claude",
+        "exportMode": "vendor"
+      },
+      "position": {
+        "x": 380,
+        "y": 160
+      }
+    },
+    {
+      "id": "n3",
+      "type": "agent",
+      "label": "Reviewer",
+      "data": {
+        "name": "pr-reviewer",
+        "rootId": "personal:~/.claude",
+        "exportMode": "reference"
+      },
+      "position": {
+        "x": 640,
+        "y": 200
+      }
+    },
+    {
+      "id": "n4",
+      "type": "output",
+      "label": "Verdict",
+      "data": {
+        "description": "The review digest."
+      },
+      "position": {
+        "x": 900,
+        "y": 240
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "source": "n1",
+      "target": "n2"
+    },
+    {
+      "id": "e2",
+      "source": "n2",
+      "target": "n3"
+    },
+    {
+      "id": "e3",
+      "source": "n3",
+      "target": "n4"
+    }
+  ]
+}

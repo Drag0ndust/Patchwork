@@ -22,7 +22,54 @@ const unitFixtures = join(repoRoot, "src/domain/__fixtures__");
 const e2eFixtures = join(repoRoot, "tests/e2e/fixtures");
 
 const DOCUMENT_PATH = "/Users/e2e/workflows/vendor-mix.patchwork";
+const CONDITIONAL_PATH = "/Users/e2e/workflows/triage-report.patchwork";
+const WIDE_PATH = "/Users/e2e/workflows/wide.patchwork";
+const SAVE_PATH = "/Users/e2e/workflows/saved.patchwork";
 const DEST_DIR = "/Users/e2e/Desktop";
+
+/** How many branches a conditional may offer before the export refuses it. */
+const BRANCH_LIMIT = 64;
+
+/**
+ * A workflow whose one conditional has `branches` ways out, all wired to the same next node.
+ *
+ * Built here rather than committed as a fixture: at 20,000 branches the file is 2.1 MB, and the
+ * *number* is the whole point of the test.
+ */
+function wideDocument(branches: number): string {
+  return JSON.stringify({
+    schemaVersion: 4,
+    workflow: { name: "Wide", description: "A conditional with far too many branches." },
+    nodes: [
+      { id: "n1", type: "input", label: "In", data: { parameters: [{ name: "topic" }] } },
+      {
+        id: "c1",
+        type: "conditional",
+        label: "Which?",
+        data: {
+          mode: "llm",
+          question: "Which one?",
+          branches: Array.from({ length: branches }, (_, at) => ({
+            id: `b${at}`,
+            label: `branch ${at}`,
+          })),
+        },
+      },
+      { id: "n2", type: "prompt", label: "Step", data: { instruction: "do it" } },
+      { id: "n3", type: "output", label: "Out", data: { description: "the answer" } },
+    ],
+    edges: [
+      { id: "e-in", source: "n1", target: "c1" },
+      { id: "e-out", source: "n2", target: "n3" },
+      ...Array.from({ length: branches }, (_, at) => ({
+        id: `e${at}`,
+        source: "c1",
+        target: "n2",
+        branch: `b${at}`,
+      })),
+    ],
+  });
+}
 
 /** Every file under `dir`, path relative and POSIX-separated, sorted. */
 function fileSet(dir: string): Array<{ path: string; contents: string }> {
@@ -72,6 +119,10 @@ function backend(overrides: Partial<FakeBackend> = {}): FakeBackend {
     scan: scanReport(),
     documents: {
       [DOCUMENT_PATH]: readFileSync(join(e2eFixtures, "vendor-mix.patchwork"), "utf8"),
+      [CONDITIONAL_PATH]: readFileSync(
+        join(e2eFixtures, "conditional.patchwork"),
+        "utf8",
+      ),
     },
     openDocument: DOCUMENT_PATH,
     openDirectory: DEST_DIR,
@@ -85,6 +136,11 @@ test("given a loaded vendor-mix document when exported then the emitted tree is 
 }) => {
   await installTauriStub(page, backend());
   await page.goto("/");
+
+  // The scan has to have landed before anything is exported: a vendor-copy node's bytes come
+  // from the catalog, so a click that beats the scan is refused for a reason that has nothing
+  // to do with what the test is about. It used to be implicit in how fast the page was.
+  await expect(page.getByRole("contentinfo")).toHaveText(/Imported \d+ skill/);
 
   await page.getByRole("button", { name: "Load" }).click();
   await expect(page.getByRole("contentinfo")).toHaveText(`Loaded ${DOCUMENT_PATH}`);
@@ -112,6 +168,11 @@ test("given a workflow name too long for the bundle directory when exported then
 }) => {
   await installTauriStub(page, backend());
   await page.goto("/");
+
+  // The scan has to have landed before anything is exported: a vendor-copy node's bytes come
+  // from the catalog, so a click that beats the scan is refused for a reason that has nothing
+  // to do with what the test is about. It used to be implicit in how fast the page was.
+  await expect(page.getByRole("contentinfo")).toHaveText(/Imported \d+ skill/);
   await page.getByRole("button", { name: "Load" }).click();
   await expect(page.getByRole("contentinfo")).toHaveText(`Loaded ${DOCUMENT_PATH}`);
 
@@ -139,6 +200,11 @@ test("given one character less when exported then the same document exports", as
 }) => {
   await installTauriStub(page, backend());
   await page.goto("/");
+
+  // The scan has to have landed before anything is exported: a vendor-copy node's bytes come
+  // from the catalog, so a click that beats the scan is refused for a reason that has nothing
+  // to do with what the test is about. It used to be implicit in how fast the page was.
+  await expect(page.getByRole("contentinfo")).toHaveText(/Imported \d+ skill/);
   await page.getByRole("button", { name: "Load" }).click();
   await expect(page.getByRole("contentinfo")).toHaveText(`Loaded ${DOCUMENT_PATH}`);
 
@@ -150,4 +216,173 @@ test("given one character less when exported then the same document exports", as
   await expect(page.getByRole("contentinfo")).toContainText("Exported bundle to");
   const [exported] = await callsTo(page, "export_bundle");
   expect((exported.tree as BundleTree).dirName).toHaveLength(64);
+});
+
+test("given a loaded branching document when exported then the bundle carries the branch instructions", async ({
+  page,
+}) => {
+  // The branch prose is what makes an exported workflow take one path or the other, so
+  // what matters here is that it survives the *round trip through the app*: a branch is
+  // stored as an edge field, drawn as a source handle, and read back off that handle —
+  // three representations that a wiring mistake would silently flatten into a linear
+  // chain the compiler's own tests would never see.
+  await installTauriStub(page, backend({ openDocument: CONDITIONAL_PATH }));
+  await page.goto("/");
+
+  // The scan has to have landed before anything is exported: a vendor-copy node's bytes come
+  // from the catalog, so a click that beats the scan is refused for a reason that has nothing
+  // to do with what the test is about. It used to be implicit in how fast the page was.
+  await expect(page.getByRole("contentinfo")).toHaveText(/Imported \d+ skill/);
+
+  await page.getByRole("button", { name: "Load" }).click();
+  await expect(page.getByRole("contentinfo")).toHaveText(`Loaded ${CONDITIONAL_PATH}`);
+  // The branch labels are readable on the canvas, on the edges that carry them.
+  await expect(page.locator(".react-flow__edge-text", { hasText: "with trace" })).toHaveCount(1);
+  await expect(page.locator(".react-flow__edge-text", { hasText: "no trace" })).toHaveCount(1);
+
+  await page.getByRole("button", { name: "Export" }).click();
+
+  await expect(page.getByRole("contentinfo")).toHaveText(
+    `Exported bundle to ${DEST_DIR}/patchwork-triage-report`,
+  );
+  const [exported] = await callsTo(page, "export_bundle");
+  const tree = exported.tree as BundleTree;
+  expect(tree.files.map((f) => f.path)).toEqual(["SKILL.md"]);
+  expect(tree.files[0].contents).toBe(
+    readFileSync(join(unitFixtures, "conditional/SKILL.md"), "utf8"),
+  );
+});
+
+test("given a document with more branches than the canvas draws when loaded then it opens fast, flagged, and unexportable", async ({
+  page,
+}) => {
+  // The measurement this exists for: 20,000 branches used to take **10.8 s** to load and render
+  // in this very browser, because the node drew a handle per branch and React Flow was handed
+  // an edge per branch — and then the export *succeeded*, so the user got a frozen minute and no
+  // error. Refusing to open the file closed the freeze and opened a worse hole (a document that
+  // could never be repaired in the app), so what is bounded now is what the canvas draws.
+  // Its own backend: a 2.1 MB document in the stub every *other* test installs delays their
+  // import scan enough to change what they are testing.
+  await installTauriStub(
+    page,
+    backend({ openDocument: WIDE_PATH, documents: { [WIDE_PATH]: wideDocument(20_000) } }),
+  );
+  await page.goto("/");
+
+  // The scan has to have landed before anything is exported: a vendor-copy node's bytes come
+  // from the catalog, so a click that beats the scan is refused for a reason that has nothing
+  // to do with what the test is about. It used to be implicit in how fast the page was.
+  await expect(page.getByRole("contentinfo")).toHaveText(/Imported \d+ skill/);
+
+  const started = Date.now();
+  await page.getByRole("button", { name: "Load" }).click();
+  await expect(page.getByRole("contentinfo")).toHaveText(`Loaded ${WIDE_PATH}`);
+  // Every branch is still in the document; only the drawing is bounded.
+  await expect(page.locator(".pw-node__branch")).toHaveCount(BRANCH_LIMIT);
+  await expect(
+    page.getByText(
+      `20000 branches, over the limit of ${BRANCH_LIMIT} — the rest are in the document but not drawn`,
+    ),
+  ).toBeVisible();
+  const elapsed = Date.now() - started;
+
+  // The edges React Flow was given are bounded too: the two plain ones plus the branches drawn.
+  // Loose budget, and still an order of magnitude under what this document used to cost.
+  expect(await page.locator(".react-flow__edge").count()).toBeLessThanOrEqual(BRANCH_LIMIT + 2);
+  expect(elapsed).toBeLessThan(3_000);
+
+  await page.getByRole("button", { name: "Export" }).click();
+
+  await expect(page.getByRole("list", { name: "Validation errors" })).toContainText(
+    `Conditional node 'c1' offers 20000 branches; at most ${BRANCH_LIMIT} can be written as a choice`,
+  );
+  await expect(page.getByRole("contentinfo")).toHaveText(
+    "Cannot export: fix validation errors first.",
+  );
+  expect(await callsTo(page, "export_bundle")).toHaveLength(0);
+});
+
+/** Every edge in a saved document whose source or target node is not in it. */
+function orphanedEdges(written: string): Array<Record<string, unknown>> {
+  const doc = JSON.parse(written) as {
+    nodes: Array<{ id: string }>;
+    edges: Array<Record<string, unknown>>;
+  };
+  const ids = new Set(doc.nodes.map((node) => node.id));
+  return doc.edges.filter(
+    (edge) => !ids.has(edge.source as string) || !ids.has(edge.target as string),
+  );
+}
+
+test("given an over-wide conditional when it is deleted and saved then no edge is left behind", async ({
+  page,
+}) => {
+  // The keystroke this exists for. React Flow works out which edges a deleted node owns from
+  // the `edges` prop it was **given**, and an over-wide conditional withholds the edges of the
+  // branches it does not draw — so deleting the node took its 64 drawn edges and left the rest
+  // in state with a source that no longer exists. Silent, saved to disk, and unfixable in the
+  // app: nothing draws an edge whose source node is gone, so the user cannot select it.
+  //
+  // The natural sequence, too: the app has just told the user it will not export this node.
+  await installTauriStub(
+    page,
+    backend({
+      openDocument: WIDE_PATH,
+      documents: { [WIDE_PATH]: wideDocument(70) },
+      savePath: SAVE_PATH,
+    }),
+  );
+  await page.goto("/");
+  await expect(page.getByRole("contentinfo")).toHaveText(/Imported \d+ skill/);
+
+  await page.getByRole("button", { name: "Load" }).click();
+  await expect(page.getByRole("contentinfo")).toHaveText(`Loaded ${WIDE_PATH}`);
+  await expect(page.locator(".pw-node--conditional.is-over-width")).toBeVisible();
+
+  await page.locator(".pw-node--conditional").click();
+  await page.keyboard.press("Backspace");
+  await expect(page.locator(".pw-node--conditional")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByRole("contentinfo")).toHaveText(`Saved to ${SAVE_PATH}`);
+
+  const [saved] = await callsTo(page, "write_document");
+  expect(orphanedEdges(saved.contents as string)).toEqual([]);
+});
+
+test("given an ordinary node deleted from a branching workflow then only its own edges go", async ({
+  page,
+}) => {
+  // The neighbouring path the fix must not disturb: React Flow already owned every edge of an
+  // ordinary node, because none of them were withheld. Driven on the two-branch fixture rather
+  // than the wide one because a 70-row conditional covers half the canvas, and a click that
+  // cannot land is not evidence about deletion.
+  await installTauriStub(
+    page,
+    backend({ openDocument: CONDITIONAL_PATH, savePath: SAVE_PATH }),
+  );
+  await page.goto("/");
+  await expect(page.getByRole("contentinfo")).toHaveText(/Imported \d+ skill/);
+  await page.getByRole("button", { name: "Load" }).click();
+  await expect(page.getByRole("contentinfo")).toHaveText(`Loaded ${CONDITIONAL_PATH}`);
+
+  // `Extract frame` sits inside branch `with trace`, between the conditional and the merge.
+  await page.locator(".pw-node--prompt", { hasText: "Extract frame" }).click();
+  await page.keyboard.press("Backspace");
+  await expect(page.locator(".pw-node--prompt", { hasText: "Extract frame" })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByRole("contentinfo")).toHaveText(`Saved to ${SAVE_PATH}`);
+
+  const [saved] = await callsTo(page, "write_document");
+  const doc = JSON.parse(saved.contents as string) as {
+    nodes: Array<{ id: string }>;
+    edges: Array<{ id: string }>;
+  };
+  expect(orphanedEdges(saved.contents as string)).toEqual([]);
+  expect(doc.nodes.map((node) => node.id)).toEqual(["n1", "n2", "c1", "n4", "n5", "n6"]);
+  // The two edges that touched it, and only those: `c1 -[b1]-> n3` and `n3 -> n5`. The other
+  // branch is untouched, and so is the branch *itself* — deleting the step a branch leads to
+  // leaves the branch unwired, which is validation's business, not the canvas's.
+  expect(doc.edges.map((edge) => edge.id)).toEqual(["e1", "e2", "e4", "e6", "e7"]);
 });

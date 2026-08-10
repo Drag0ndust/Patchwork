@@ -258,6 +258,82 @@ describe("Exporting a vendor-copy node", () => {
   });
 });
 
+/** A saved workflow that branches on an LLM decision. */
+const CONDITIONAL_DOCUMENT = JSON.stringify({
+  schemaVersion: 4,
+  workflow: { name: "Triage", description: "Triage a report." },
+  nodes: [
+    { id: "n1", type: "input", label: "In", data: { parameters: [{ name: "report" }] } },
+    {
+      id: "c1",
+      type: "conditional",
+      label: "Has a trace?",
+      data: {
+        mode: "llm",
+        question: "Does the report contain a stack trace?",
+        branches: [
+          { id: "b1", label: "with trace" },
+          { id: "b2", label: "no trace" },
+        ],
+      },
+    },
+    { id: "n2", type: "prompt", label: "Frame", data: { instruction: "Name the frame." } },
+    { id: "n3", type: "prompt", label: "Ask", data: { instruction: "Ask for details." } },
+    { id: "n4", type: "prompt", label: "Sum", data: { instruction: "Write the summary." } },
+    { id: "n5", type: "output", label: "Out", data: { description: "The summary." } },
+  ],
+  edges: [
+    { id: "e1", source: "n1", target: "c1" },
+    { id: "e2", source: "c1", target: "n2", branch: "b1" },
+    { id: "e3", source: "c1", target: "n3", branch: "b2" },
+    { id: "e4", source: "n2", target: "n4" },
+    { id: "e5", source: "n3", target: "n4" },
+    { id: "e6", source: "n4", target: "n5" },
+  ],
+});
+
+describe("A workflow that branches", () => {
+  it("given_aConditionalDocument_whenExported_thenTheUmbrellaInstructsTheBranchChoice", async () => {
+    // The wiring, not the prose (which `compiler.test.ts` pins): the document the app
+    // hands the compiler has to be the branching document it loaded, branch ids and
+    // all, or the umbrella would come out linear.
+    bridge.scanRoots.mockResolvedValue({ artifacts: [], problems: [] });
+    bridge.readDocument.mockResolvedValue(CONDITIONAL_DOCUMENT);
+    bridge.pickExportDirectory.mockResolvedValue("/out");
+    bridge.exportBundle.mockResolvedValue("/out/patchwork-triage");
+
+    render(<App />);
+    fireEvent.click(screen.getByText("Load"));
+
+    await waitFor(() => expect(screen.getByText(/Loaded/)).toBeTruthy());
+    fireEvent.click(screen.getByText("Export"));
+    await waitFor(() => expect(bridge.exportBundle).toHaveBeenCalled());
+
+    const [tree] = bridge.exportBundle.mock.calls[0] as [
+      { files: Array<{ path: string; contents: string }> },
+    ];
+    const umbrella = tree.files.find((f) => f.path === "SKILL.md")?.contents ?? "";
+    expect(umbrella).toContain("**Branch point 1 — choose one path.**");
+    expect(umbrella).toContain("- **Branch point 1, branch `with trace`**");
+    expect(umbrella).toContain("- **Branch point 1, branch `no trace`**");
+    expect(umbrella).toContain("continue at step 2");
+  });
+
+  it("given_aFreshlyPlacedConditional_whenAdded_thenItOffersTwoWireableBranches", async () => {
+    // A conditional is placed ready to wire: two branches, each with a label and its
+    // own handle, because a one-branch conditional is not exportable.
+    bridge.scanRoots.mockResolvedValue({ artifacts: [], problems: [] });
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/from 1 source root/)).toBeTruthy());
+    fireEvent.click(screen.getByText("＋ Conditional"));
+
+    await waitFor(() => expect(screen.getByText("Conditional · LLM")).toBeTruthy());
+    expect(screen.getByText("yes")).toBeTruthy();
+    expect(screen.getByText("no")).toBeTruthy();
+  });
+});
+
 describe("Export is not re-entrant", () => {
   /**
    * `write_bundle` clears the destination and then writes the files one by one, so
@@ -564,5 +640,127 @@ describe("an obsolete in-flight scan", () => {
       expect(screen.getByText(/Imported 0 skill\(s\) and 0 agent\(s\)/)).toBeTruthy(),
     );
     expect(screen.queryByText(/Imported 1 skill/)).toBeNull();
+  });
+});
+
+/** A saved workflow whose one conditional has more branches than the export allows. */
+const OVER_WIDE_DOCUMENT = JSON.stringify({
+  schemaVersion: 4,
+  workflow: { name: "Wide", description: "A workflow with too many branches." },
+  nodes: [
+    { id: "n1", type: "input", label: "In", data: { parameters: [{ name: "topic" }] } },
+    {
+      id: "c1",
+      type: "conditional",
+      label: "Which?",
+      data: {
+        mode: "llm",
+        question: "Which one?",
+        branches: Array.from({ length: 300 }, (_, at) => ({
+          id: `b${at}`,
+          label: `branch ${at}`,
+        })),
+      },
+    },
+    { id: "n2", type: "prompt", label: "Step", data: { instruction: "do it" } },
+    { id: "n3", type: "output", label: "Out", data: { description: "the answer" } },
+  ],
+  edges: [
+    { id: "e-in", source: "n1", target: "c1" },
+    { id: "e-out", source: "n2", target: "n3" },
+    ...Array.from({ length: 300 }, (_, at) => ({
+      id: `e${at}`,
+      source: "c1",
+      target: "n2",
+      branch: `b${at}`,
+    })),
+  ],
+});
+
+describe("A document with more branches than the export allows", () => {
+  /**
+   * Refusing to *open* such a file was the wrong failure mode: it made a document that used to
+   * open unopenable, with no recovery inside the app. The pattern this follows is the one an
+   * unresolved artifact reference already uses — open, flag, stay editable, refuse at export.
+   */
+  it("given_anOverWideDocument_whenLoaded_thenItOpensAndTheNodeIsFlagged", async () => {
+    bridge.scanRoots.mockResolvedValue({ artifacts: [], problems: [] });
+    bridge.readDocument.mockResolvedValue(OVER_WIDE_DOCUMENT);
+
+    render(<App />);
+    fireEvent.click(screen.getByText("Load"));
+
+    await waitFor(() => expect(screen.getByText(/Loaded/)).toBeTruthy());
+    expect(
+      (screen.getByRole("textbox", { name: "Workflow name" }) as HTMLInputElement).value,
+    ).toBe("Wide");
+    // Flagged on the canvas, with the count and what is not drawn.
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          /300 branches, over the limit of 64 — the rest are in the document but not drawn/,
+        ),
+      ).toBeTruthy(),
+    );
+  });
+
+  it("given_anOverWideDocument_whenLoaded_thenTheCanvasDrawsOnlyWhatItCanPlace", async () => {
+    bridge.scanRoots.mockResolvedValue({ artifacts: [], problems: [] });
+    bridge.readDocument.mockResolvedValue(OVER_WIDE_DOCUMENT);
+
+    const { container } = render(<App />);
+    fireEvent.click(screen.getByText("Load"));
+    await waitFor(() => expect(screen.getByText(/Loaded/)).toBeTruthy());
+
+    // 64 branch rows, not 300 — this is what keeps the load path off the 10.8 s freeze.
+    await waitFor(() =>
+      expect(container.querySelectorAll(".pw-node__branch")).toHaveLength(64),
+    );
+    // The matching bound on *edges* — an edge whose source handle is not drawn cannot be
+    // placed, so handing React Flow 236 of them is 236 components for handles that do not
+    // exist — is asserted where edges are actually rendered: React Flow needs measured node
+    // sizes to place one, and jsdom measures nothing. See `tests/e2e/export.spec.ts`.
+  });
+
+  it("given_anOverWideDocument_whenExported_thenItIsRefusedWithAnActionableReason", async () => {
+    bridge.scanRoots.mockResolvedValue({ artifacts: [], problems: [] });
+    bridge.readDocument.mockResolvedValue(OVER_WIDE_DOCUMENT);
+
+    render(<App />);
+    fireEvent.click(screen.getByText("Load"));
+    await waitFor(() => expect(screen.getByText(/Loaded/)).toBeTruthy());
+    fireEvent.click(screen.getByText("Export"));
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          /Conditional node 'c1' offers 300 branches; at most 64 can be written as a choice/,
+        ),
+      ).toBeTruthy(),
+    );
+    expect(bridge.pickExportDirectory).not.toHaveBeenCalled();
+    expect(bridge.exportBundle).not.toHaveBeenCalled();
+  });
+
+  it("given_anOverWideDocument_whenSavedWithoutEditing_thenEveryBranchAndEdgeIsWrittenBack", async () => {
+    // The draw bound is a *rendering* filter. If it reached the canvas state, opening such a
+    // document and saving it would silently delete 236 branches' worth of wiring.
+    bridge.scanRoots.mockResolvedValue({ artifacts: [], problems: [] });
+    bridge.readDocument.mockResolvedValue(OVER_WIDE_DOCUMENT);
+    bridge.pickDocumentToSave.mockResolvedValue("/tmp/wide.patchwork");
+
+    render(<App />);
+    fireEvent.click(screen.getByText("Load"));
+    await waitFor(() => expect(screen.getByText(/Loaded/)).toBeTruthy());
+    fireEvent.click(screen.getByText("Save"));
+
+    await waitFor(() => expect(bridge.writeDocument).toHaveBeenCalled());
+    const [, written] = bridge.writeDocument.mock.calls[0] as [string, string];
+    const saved = JSON.parse(written) as {
+      nodes: Array<{ data: { branches?: unknown[] } }>;
+      edges: unknown[];
+    };
+    expect(saved.nodes[1].data.branches).toHaveLength(300);
+    expect(saved.edges).toHaveLength(302);
   });
 });

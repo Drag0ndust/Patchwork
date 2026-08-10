@@ -14,11 +14,15 @@ import { nodeTypes } from "./canvas/nodes";
 import {
   applyResolution,
   documentToFlow,
+  drawableEdges,
   flowToDocument,
+  keepConnectedEdges,
+  withBranchLabels,
   type PatchNode,
 } from "./canvas/react-flow-adapter";
 import { compile, vendorErrors } from "./domain/compiler";
 import {
+  DEFAULT_CONDITIONAL_MODE,
   DEFAULT_EXPORT_MODE,
   deserialize,
   serialize,
@@ -27,6 +31,7 @@ import {
   type NodeType,
   type WorkflowMeta,
 } from "./domain/graph-document";
+import { newId } from "./domain/ids";
 import type { RootRole } from "./domain/root-resolver";
 import {
   describeCollisions,
@@ -57,12 +62,6 @@ import {
 
 const ROOTS_STORAGE_KEY = "patchwork.sourceRoots";
 
-let idCounter = 0;
-function newId(prefix: string): string {
-  idCounter += 1;
-  return `${prefix}-${Date.now().toString(36)}-${idCounter}`;
-}
-
 function defaultData(type: NodeType): NodeData {
   switch (type) {
     case "input":
@@ -76,6 +75,19 @@ function defaultData(type: NodeType): NodeData {
       // Bound to an artifact by the picker in the dock editor. Reference-by-name
       // until the user asks for a copy — see `DEFAULT_EXPORT_MODE`.
       return { name: "", rootId: "", exportMode: DEFAULT_EXPORT_MODE };
+    case "conditional":
+      // Two branches, because one is not a choice and `validateGraph` refuses it —
+      // a freshly placed conditional is wireable straight away. The labels are
+      // starting points the user is expected to replace; they are what the exported
+      // prose asks the model to choose between, so they must not be blank.
+      return {
+        mode: DEFAULT_CONDITIONAL_MODE,
+        question: "",
+        branches: [
+          { id: newId("branch"), label: "yes" },
+          { id: newId("branch"), label: "no" },
+        ],
+      };
   }
 }
 
@@ -86,6 +98,7 @@ function defaultLabel(type: NodeType): string {
     output: "Output",
     skill: "Skill",
     agent: "Agent",
+    conditional: "Conditional",
   }[type];
 }
 
@@ -313,6 +326,34 @@ export function App() {
     [setNodes],
   );
 
+  /**
+   * What the canvas is given: the edges it can place, labelled with the branch each one leaves
+   * its source by.
+   *
+   * Both passes are derived on render rather than stored. The label belongs to the node's
+   * branch, so renaming one re-labels its edges without the edge list being edited (the
+   * document keeps only the branch id — see ADR-0003); and an over-wide conditional draws only
+   * as many handles as it can, so the edges of the branches it did not draw cannot be placed
+   * and are not handed over. Neither pass touches `edges` state, which is what a save writes —
+   * opening an over-wide document and saving it must not lose the branches it holds. Both are
+   * identity-stable, so the common case allocates nothing.
+   */
+  const canvasEdges = useMemo(
+    () => withBranchLabels(nodes, drawableEdges(nodes, edges)),
+    [nodes, edges],
+  );
+
+  // An edge cannot outlive what it joins. Removing a branch removes the path it named, and
+  // removing a *node* removes every edge that touched it — React Flow does the second one
+  // itself, but only for the edges it was given, and an over-wide conditional withholds the
+  // ones it cannot draw. So the canvas state is reconciled here, on every change to the nodes,
+  // which is when either can happen (including on load, and for any future way of removing a
+  // node). `keepConnectedEdges` returns the same array when there is nothing to prune, so this
+  // settles in one pass and never loops.
+  useEffect(() => {
+    setEdges((eds) => keepConnectedEdges(nodes, eds));
+  }, [nodes, setEdges]);
+
   const currentDocument = useCallback(
     () => flowToDocument(nodes, edges, workflow),
     [nodes, edges, workflow],
@@ -433,6 +474,7 @@ export function App() {
         <div className="pw-toolbar__group">
           <button onClick={() => addNode("input")}>＋ Input</button>
           <button onClick={() => addNode("prompt")}>＋ Prompt</button>
+          <button onClick={() => addNode("conditional")}>＋ Conditional</button>
           <button onClick={() => addNode("skill")}>＋ Skill</button>
           <button onClick={() => addNode("agent")}>＋ Agent</button>
           <button onClick={() => addNode("output")}>＋ Output</button>
@@ -474,7 +516,7 @@ export function App() {
       <div className="pw-canvas">
         <ReactFlow
           nodes={nodes}
-          edges={edges}
+          edges={canvasEdges}
           nodeTypes={nodeTypes}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
