@@ -184,7 +184,16 @@ export const NUMERIC_RULE_OPERATORS: RuleOperator[] = ["greater-than", "less-tha
  */
 export function comparedOperand(rule: ConditionalRule): string {
   const operand = rule.operand ?? "";
-  return NUMERIC_RULE_OPERATORS.includes(rule.operator) ? operand.trim() : operand;
+  if (!NUMERIC_RULE_OPERATORS.includes(rule.operator)) return operand;
+  // Trimmed only where trimming is what makes the comparison possible. A numeric rule whose
+  // operand is not a number compares *nothing* — `validateGraph` refuses it — so there is no
+  // normalized form of it to speak of, and inventing one throws away what the user typed:
+  // `contains " x "` switched to a numeric comparison and straight back came home as
+  // `"x"`, because the intermediate state answered this question as though it had compared
+  // something. Each switch looked correct on its own; the pair lost data. What has no
+  // meaning is left exactly as it is.
+  const trimmed = operand.trim();
+  return isWholeNumber(trimmed) ? trimmed : operand;
 }
 
 /**
@@ -245,8 +254,29 @@ export const RULE_OPERATOR_SYMBOLS: Record<RuleOperator, string> = {
  */
 export function describeRule(rule: ConditionalRule): string {
   const operand = comparedOperand(rule);
-  const shown = NUMERIC_RULE_OPERATORS.includes(rule.operator) ? operand : `"${operand}"`;
+  // Bare only when there is provably nothing to hide: a numeric comparison whose operand is
+  // the digits it compares. A numeric rule that kept its padding is one `validateGraph`
+  // refuses *because* of the padding, so that is exactly when it has to be visible.
+  const bare =
+    NUMERIC_RULE_OPERATORS.includes(rule.operator) && operand === operand.trim();
+  const shown = bare ? operand : `"${quoteOperand(operand)}"`;
   return `${rule.subject} ${RULE_OPERATOR_SYMBOLS[rule.operator] ?? rule.operator} ${shown}`.trim();
+}
+
+/**
+ * An operand's own delimiters, escaped, so the quoted region has exactly one end.
+ *
+ * Without it `contains 'a"b'` summarised to `subject contains "a"b"`, which is three quotes
+ * and no way to tell which of them closes the value — defeating the single thing the
+ * quoting was added for. The backslash is escaped first, so the escape itself is
+ * unambiguous: `a\b` reads as a literal backslash rather than as an escaped `b`.
+ *
+ * This is a *display* rule, and it is the whole extent of it — nothing here is parsed back,
+ * and the string is React text output rather than markup, so there is no injection to
+ * defend against. Only legibility, in the one line a canvas node has.
+ */
+function quoteOperand(operand: string): string {
+  return operand.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
 /** The default a freshly made rule starts from. */

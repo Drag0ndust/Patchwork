@@ -1896,6 +1896,82 @@ describe("validateGraph — rule-based conditional nodes", () => {
     },
   );
 
+  it("given_aPaddedStringOperand_whenTheComparisonDetoursThroughANumericOneAndBack_thenThePaddingSurvives", () => {
+    // The reviewer's repro. Each switch satisfies the per-step invariant on its own — the
+    // detour keeps the operand, and the return trims what a numeric comparison would have
+    // ignored — but *composed* they delete padding the user typed, within one visible frame
+    // of tapping through the dropdown. A rule that never compared anything (this one is
+    // refused: ` x ` is not a number) has no meaning to normalize towards.
+    const rule: ConditionalRule = {
+      subject: "the label",
+      operator: "contains",
+      operand: " x ",
+      whenTrue: "b1",
+      whenFalse: "b2",
+    };
+
+    const detoured = withOperator(rule, "greater-than");
+    const back = withOperator(detoured, "contains");
+
+    expect(detoured.operand).toBe(" x ");
+    expect(back).toEqual(rule);
+  });
+
+  it("given_anyComparisonRoundTrip_whenTheDetourIsRefused_thenNothingTheUserTypedIsTouched", () => {
+    // The pin has to be on the **composition**, because that is where the loss lives. Two
+    // rules, swept over every pair of comparisons:
+    //
+    // - if the detour is a rule `validateGraph` refuses, nothing was ever compared through
+    //   it, so the operand comes back byte-identical;
+    // - if the detour is valid, what it compared is what comes back — the B3 invariant,
+    //   asserted across a round trip rather than a single step.
+    const operands = [" x ", "x", " 5 ", "5", " 5x ", "0009", " a b "];
+    const comparisons = [
+      "equals",
+      "not-equals",
+      "contains",
+      "greater-than",
+      "less-than",
+    ] as const;
+    const lost: string[] = [];
+
+    for (const from of comparisons) {
+      for (const operand of operands) {
+        const rule: ConditionalRule = {
+          subject: "the label",
+          operator: from,
+          operand,
+          whenTrue: "b1",
+          whenFalse: "b2",
+        };
+        const doc = ruleConditionalDocument();
+        conditionalOf(doc).rule = rule;
+        // Only rules that are themselves usable have a meaning to preserve.
+        if (!validateGraph(doc).ok) continue;
+
+        for (const via of comparisons) {
+          const detoured = withOperator(rule, via);
+          const back = withOperator(detoured, from);
+          const detour = ruleConditionalDocument();
+          conditionalOf(detour).rule = detoured;
+
+          const expected = validateGraph(detour).ok
+            ? comparedOperand(detoured)
+            : operand;
+          if (comparedOperand(back) !== expected) {
+            lost.push(
+              `${from} ${JSON.stringify(operand)} via ${via}: ${JSON.stringify(
+                comparedOperand(back),
+              )} != ${JSON.stringify(expected)}`,
+            );
+          }
+        }
+      }
+    }
+
+    expect(lost).toEqual([]);
+  });
+
   it.each([
     ["a numeric comparison", "greater-than", "100", "lines changed > 100"],
     ["a string comparison", "equals", "closed", 'lines changed = "closed"'],
@@ -1903,6 +1979,14 @@ describe("validateGraph — rule-based conditional nodes", () => {
     // collapses whitespace runs: quoted, the padding is there to see.
     ["a padded string comparison", "equals", " 5", 'lines changed = " 5"'],
     ["interior padding", "contains", "a  b", 'lines changed contains "a  b"'],
+    // A padded operand under a numeric comparison is a rule the export refuses, and the
+    // padding is why — so the summary shows it rather than rendering as the valid rule it
+    // is not.
+    ["padding a number cannot have", "greater-than", " 5x ", 'lines changed > " 5x "'],
+    // The delimiter is escaped inside the value, so the quoted region has exactly one end
+    // however many quotes the operand contains.
+    ["an operand containing the delimiter", "contains", 'a"b', 'lines changed contains "a\\"b"'],
+    ["an operand containing a backslash", "contains", "a\\b", 'lines changed contains "a\\\\b"'],
   ] as const)(
     "given_%s_whenDescribingTheRule_thenWhatIsComparedIsVisible",
     (_case, operator, operand, expected) => {
@@ -2225,3 +2309,5 @@ describe("deserialize — forward migration to v5", () => {
     expect(conditionalModeOf(conditional?.data as ConditionalData)).toBe("llm");
   });
 });
+
+

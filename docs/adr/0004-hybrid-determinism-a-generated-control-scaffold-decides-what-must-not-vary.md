@@ -124,6 +124,16 @@ measured `5` then routed to the **false** branch at exit 0. That is the one fail
 refusal contract cannot catch, since it only engages on a non-zero exit, and the umbrella
 carries neither the operator nor the operand, so the reading model cannot notice it either.
 
+The normalization is confined to values that *have* an effective meaning. A numeric rule
+whose operand is not a number compares nothing — `validateGraph` refuses it — so it has no
+normalized form, and inventing one costs the user data: `contains " x "` switched to a
+numeric comparison and straight back came home as `"x"`. Each step satisfied the per-step
+invariant; the *composition* deleted padding the author typed, inside one visible frame of
+tapping through the dropdown. So `comparedOperand` trims only where trimming is what makes
+the comparison possible, and the pin is on the round trip rather than on another single
+step: a detour the validator refuses returns the operand byte-identical, and a detour it
+accepts returns what that detour compared.
+
 The invariant is therefore stated as: **the operand's effective meaning never changes unless
 the user changes it** — and where padding *is* semantic, it is now visible. `describeRule`
 quotes every string operand (` 5` and `5` were the same pixels on the canvas, because HTML
