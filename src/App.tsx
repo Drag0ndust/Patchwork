@@ -18,6 +18,7 @@ import {
   flowToDocument,
   keepConnectedEdges,
   withBranchLabels,
+  withInputLabels,
   type PatchNode,
 } from "./canvas/react-flow-adapter";
 import { compile, vendorErrors } from "./domain/compiler";
@@ -328,7 +329,8 @@ export function App() {
 
   /**
    * What the canvas is given: the edges it can place, labelled with the branch each one leaves
-   * its source by.
+   * its source by and — where several paths arrive at one node — with what each of them
+   * carries there.
    *
    * Both passes are derived on render rather than stored. The label belongs to the node's
    * branch, so renaming one re-labels its edges without the edge list being edited (the
@@ -339,7 +341,7 @@ export function App() {
    * identity-stable, so the common case allocates nothing.
    */
   const canvasEdges = useMemo(
-    () => withBranchLabels(nodes, drawableEdges(nodes, edges)),
+    () => withInputLabels(nodes, withBranchLabels(nodes, drawableEdges(nodes, edges))),
     [nodes, edges],
   );
 

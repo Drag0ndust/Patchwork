@@ -172,6 +172,89 @@ describe("planWorkflow", () => {
 });
 
 /**
+ * A plain split: `i` fans out into two paths that are **both** done, and they come back
+ * together at `merge`, which reads both results.
+ *
+ * ```
+ * i -> draft    -\
+ *  \-> research -+-> merge -> o
+ * ```
+ */
+function fanInDocument(): PatchworkDocument {
+  return {
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    workflow: { name: "Fan in", description: "d" },
+    nodes: [
+      { id: "i", type: "input", label: "In", data: { parameters: [{ name: "x" }] } },
+      { id: "draft", type: "prompt", label: "Draft", data: { instruction: "draft" } },
+      {
+        id: "research",
+        type: "prompt",
+        label: "Research",
+        data: { instruction: "research" },
+      },
+      { id: "merge", type: "prompt", label: "Merge", data: { instruction: "merge" } },
+      { id: "o", type: "output", label: "Out", data: { description: "r" } },
+    ],
+    edges: [
+      { id: "e1", source: "i", target: "draft" },
+      { id: "e2", source: "i", target: "research" },
+      { id: "e3", source: "draft", target: "merge" },
+      { id: "e4", source: "research", target: "merge" },
+      { id: "e5", source: "merge", target: "o" },
+    ],
+  };
+}
+
+describe("planWorkflow — a plain split runs every path", () => {
+  it("given_aNodeThatSplitsIntoTwoPaths_whenPlanned_thenBothPathsRunBeforeTheyMerge", () => {
+    // Unlike a conditional, where exactly one path is taken, every path of a plain split
+    // is followed — so the plan is one flat list, not a branch segment.
+    expect(outline(planWorkflow(fanInDocument()).segments)).toBe(
+      "i -> draft -> research -> merge -> o",
+    );
+  });
+
+  it("given_aNodeThatSplitsIntoTwoPaths_whenPlanned_thenNothingIsReportedAsAProblem", () => {
+    expect(planWorkflow(fanInDocument()).problems).toEqual([]);
+  });
+
+  it("given_aSplitWhosePathsAreOfDifferentLengths_whenPlanned_thenTheMergeIsNotSwallowedIntoOne", () => {
+    const doc = fanInDocument();
+    doc.nodes.push({ id: "d2", type: "prompt", label: "D2", data: { instruction: "d2" } });
+    doc.edges = doc.edges.map((e) => (e.id === "e3" ? { ...e, target: "d2" } : e));
+    doc.edges.push({ id: "e6", source: "d2", target: "merge" });
+
+    expect(outline(planWorkflow(doc).segments)).toBe(
+      "i -> draft -> d2 -> research -> merge -> o",
+    );
+  });
+
+  it("given_aSplitWhoseTwoEdgesLeadToTheSameNode_whenPlanned_thenThatNodeIsInstructedOnce", () => {
+    const doc = fanInDocument();
+    doc.edges = doc.edges.map((e) => (e.id === "e2" ? { ...e, target: "draft" } : e));
+    doc.edges = doc.edges.filter((e) => e.id !== "e4");
+    doc.nodes = doc.nodes.filter((n) => n.id !== "research");
+
+    const plan = planWorkflow(doc);
+
+    expect(outline(plan.segments)).toBe("i -> draft -> merge -> o");
+    expect(plan.problems).toEqual([]);
+  });
+
+  it("given_aSplitInsideABranch_whenPlanned_thenItsPathsStayInsideThatBranch", () => {
+    const doc = branchingDocument();
+    doc.nodes.push({ id: "A2", type: "prompt", label: "A2", data: { instruction: "a2" } });
+    doc.edges.push({ id: "e8", source: "A", target: "A2" });
+    doc.edges.push({ id: "e9", source: "A2", target: "sum" });
+
+    expect(outline(planWorkflow(doc).segments)).toBe(
+      "i -> assess -> c(a: A -> A2 | b: B) -> sum -> o",
+    );
+  });
+});
+
+/**
  * `depth` conditionals nested one inside the other, and a merge chain that closes them
  * in the reverse order:
  *
@@ -463,9 +546,11 @@ describe("planWorkflow — the rule holds on a document with a cycle too", () =>
     // today, because `validateGraph` refuses a cycle; loops are a planned slice, and a
     // rule that is only true on currently-legal input is not the rule as written.
     expect(outline(planWorkflow(cyclicDocument()).segments)).toBe(
-      // `x` is the convergence point, so it is a step of the enclosing sequence; `o` is
-      // appended because the cycle keeps the walk from reaching it.
-      "i -> c1(a:  | b: m) -> x -> o",
+      // `x` is the convergence point, so it is a step of the enclosing sequence — which
+      // is what this test is about. `o` sits inside branch `b` because `m` splits into
+      // `x` and `o` and every path of a plain split is followed: `x` is the branch's
+      // stop, `o` is not.
+      "i -> c1(a:  | b: m -> o) -> x",
     );
   });
 
@@ -574,7 +659,17 @@ function referencePlan(doc: PatchworkDocument): { outline: string; problems: num
       const edges = outgoing.get(cursor) ?? [];
       if (node.type !== "conditional") {
         collect.push({ kind: "step", node });
-        cursor = edges[0]?.target;
+        const paths = [...new Set(edges.map((edge) => edge.target))];
+        if (paths.length <= 1) {
+          cursor = paths[0];
+          continue;
+        }
+        // A plain split: every path is followed, into this same list, and the walk
+        // resumes where they converge.
+        const merge = convergenceOf(paths);
+        const beyond = merge === undefined ? stop : new Set([...stop, merge]);
+        for (const path of paths) walk(collect, path, beyond);
+        cursor = merge;
         continue;
       }
       const heads = new Map<string, string>();
@@ -608,6 +703,19 @@ function referencePlan(doc: PatchworkDocument): { outline: string; problems: num
     );
   }
   return { outline: outline(segments), problems };
+}
+
+/** True when some node other than a conditional leads to more than one node. */
+function hasPlainSplit(doc: PatchworkDocument): boolean {
+  const ways = new Map<string, Set<string>>();
+  for (const edge of doc.edges) {
+    const targets = ways.get(edge.source) ?? new Set<string>();
+    targets.add(edge.target);
+    ways.set(edge.source, targets);
+  }
+  return doc.nodes.some(
+    (node) => node.type !== "conditional" && (ways.get(node.id)?.size ?? 0) > 1,
+  );
 }
 
 /** True when every edge points forward through the node list, i.e. the document is acyclic. */
@@ -680,7 +788,15 @@ function randomDocuments(
     let edgeId = 0;
     nodes.forEach((source, position) => {
       if (source.type === "output") return;
-      const ways = source.type === "conditional" ? ["a", "b"] : [undefined];
+      // A conditional always takes both its branches; anything else splits into two
+      // paths about a third of the time, which is the only way the corpus reaches the
+      // plain-split walk at all.
+      const ways =
+        source.type === "conditional"
+          ? ["a", "b"]
+          : next() < 0.3
+            ? [undefined, undefined]
+            : [undefined];
       for (const branch of ways) {
         const back = next() < backwards;
         const candidates = nodes
@@ -721,9 +837,11 @@ describe("planWorkflow — differential against the rule as written", () => {
       const mismatches: string[] = [];
       let widest = 0;
       let acyclic = 0;
+      let split = 0;
       for (const doc of randomDocuments(count, seed, backwards, size)) {
         widest = Math.max(widest, doc.nodes.length);
         if (isForwardOnly(doc)) acyclic += 1;
+        if (hasPlainSplit(doc)) split += 1;
         const mine = planWorkflow(doc);
         const reference = referencePlan(doc);
         if (
@@ -744,6 +862,9 @@ describe("planWorkflow — differential against the rule as written", () => {
       expect(widest).toBeGreaterThan(size > 1 ? 32 : 3);
       expect(acyclic).toBe(backwards === 0 ? count : acyclic);
       if (backwards === 0) expect(acyclic).toBe(count);
+      // And that the corpus really contains plain splits, which is the other walk the
+      // two implementations have to agree about.
+      expect(split).toBeGreaterThan(0);
     },
   );
 

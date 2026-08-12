@@ -13,6 +13,7 @@ import {
   flowToDocument,
   keepConnectedEdges,
   withBranchLabels,
+  withInputLabels,
 } from "./react-flow-adapter";
 
 function doc(): PatchworkDocument {
@@ -650,5 +651,153 @@ describe("the canvas adapter — a branch entry that is not a branch", () => {
     expect(flow.edges[0].label).toBe("labelled");
     expect(drawableEdges(flow.nodes, flow.edges)).toBe(flow.edges);
     expect(keepConnectedEdges(flow.nodes, flow.edges)).toBe(flow.edges);
+  });
+});
+
+/**
+ * A canvas where two paths fan into one node:
+ *
+ * ```
+ * n1 -> draft    -\
+ *   \-> research -+-> merge
+ * ```
+ */
+function fanInDoc(): PatchworkDocument {
+  return {
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    workflow: { name: "Fan in", description: "d" },
+    nodes: [
+      {
+        id: "n1",
+        type: "input",
+        label: "Topic",
+        data: { parameters: [{ name: "topic" }] },
+      },
+      { id: "draft", type: "prompt", label: "Draft", data: { instruction: "d" } },
+      { id: "research", type: "prompt", label: "Research", data: { instruction: "r" } },
+      { id: "merge", type: "prompt", label: "Merge", data: { instruction: "m" } },
+    ],
+    edges: [
+      { id: "e1", source: "n1", target: "draft" },
+      { id: "e2", source: "n1", target: "research" },
+      { id: "e3", source: "draft", target: "merge" },
+      { id: "e4", source: "research", target: "merge" },
+    ],
+  };
+}
+
+describe("withInputLabels — a fan-in says on the canvas what each path carries", () => {
+  it("given_twoPathsIntoOneNode_whenLabelled_thenEachEdgeShowsWhatItCarries", () => {
+    const flow = documentToFlow(fanInDoc());
+
+    const labelled = withInputLabels(flow.nodes, flow.edges);
+
+    expect(labelled.find((e) => e.id === "e3")?.label).toBe("Draft");
+    expect(labelled.find((e) => e.id === "e4")?.label).toBe("Research");
+  });
+
+  it("given_aSinglePathIntoANode_whenLabelled_thenItsEdgeIsLeftAlone", () => {
+    // One input needs no name: the step's own instruction already says what it works
+    // from, and a label per edge would be noise on every graph that does not fan in.
+    const flow = documentToFlow(fanInDoc());
+
+    const labelled = withInputLabels(flow.nodes, flow.edges);
+
+    expect(labelled.find((e) => e.id === "e1")?.label).toBeUndefined();
+    expect(labelled).toBe(withInputLabels(flow.nodes, labelled));
+  });
+
+  it("given_anEdgeWithItsOwnInputLabel_whenLabelled_thenTheAuthorsLabelWins", () => {
+    const document = fanInDoc();
+    document.edges[2].inputLabel = "the draft so far";
+    const flow = documentToFlow(document);
+
+    expect(withInputLabels(flow.nodes, flow.edges).find((e) => e.id === "e3")?.label).toBe(
+      "the draft so far",
+    );
+  });
+
+  it("given_anEdgeWithAnInputLabel_whenRoundTripped_thenTheLabelSurvives", () => {
+    // Derived on the canvas, persisted in the document: a label the user wrote must
+    // not be lost by opening the file and saving it again.
+    const original = fanInDoc();
+    original.edges[3].inputLabel = "the facts";
+    const flow = documentToFlow(original);
+
+    expect(flowToDocument(flow.nodes, flow.edges, original.workflow).edges).toEqual(
+      original.edges,
+    );
+  });
+
+  it("given_aConditionalsBranchTailsMeeting_whenLabelled_thenTheyAreNamedEvenThoughNoStepConcatenatesThem", () => {
+    // A deliberate, pinned divergence from the compiler, not an oversight. The compiler
+    // emits **no** fan-in prose here — only one branch runs, so only one result arrives —
+    // while the canvas names both edges, because what it states is what an edge *carries*,
+    // which is true of each of them whichever branch is taken. The canvas never claims the
+    // results are concatenated; the step that would say so is the umbrella's.
+    //
+    // Answering the compiler's question instead would mean planning the document on every
+    // canvas change — a drag is a new `nodes` array per frame, and a branching document's
+    // plan allocates a transitive closure (8 MB at the node limit). That is the
+    // frozen-window cost this codebase treats as a defect, paid on every frame, to remove
+    // two labels that are not wrong. See ADR-0005.
+    const document = fanInDoc();
+    document.nodes.push(
+      {
+        id: "c1",
+        type: "conditional",
+        label: "Which?",
+        data: {
+          mode: "llm",
+          question: "Which?",
+          branches: [
+            { id: "b1", label: "yes" },
+            { id: "b2", label: "no" },
+          ],
+        },
+      },
+      { id: "y", type: "prompt", label: "Yes path", data: { instruction: "y" } },
+      { id: "n", type: "prompt", label: "No path", data: { instruction: "n" } },
+      { id: "j", type: "prompt", label: "Join", data: { instruction: "j" } },
+    );
+    document.edges.push(
+      { id: "e5", source: "c1", target: "y", branch: "b1" },
+      { id: "e6", source: "c1", target: "n", branch: "b2" },
+      { id: "e7", source: "y", target: "j" },
+      { id: "e8", source: "n", target: "j" },
+    );
+    const flow = documentToFlow(document);
+
+    const labelled = withInputLabels(flow.nodes, flow.edges);
+
+    expect(labelled.find((e) => e.id === "e7")?.label).toBe("Yes path");
+    expect(labelled.find((e) => e.id === "e8")?.label).toBe("No path");
+  });
+
+  it("given_aBranchEdge_whenLabelled_thenItKeepsTheBranchLabelItAlreadyHas", () => {
+    // A branch is an alternative, not an input, and its label is the branch's — so the
+    // two labellers cannot land on the same edge.
+    const document = fanInDoc();
+    document.nodes.push({
+      id: "c1",
+      type: "conditional",
+      label: "Which?",
+      data: {
+        mode: "llm",
+        question: "Which?",
+        branches: [
+          { id: "b1", label: "yes" },
+          { id: "b2", label: "no" },
+        ],
+      },
+    });
+    document.edges.push({ id: "e5", source: "c1", target: "merge", branch: "b1" });
+    document.edges.push({ id: "e6", source: "c1", target: "merge", branch: "b2" });
+    const flow = documentToFlow(document);
+
+    const labelled = withInputLabels(flow.nodes, flow.edges);
+
+    expect(labelled.find((e) => e.id === "e5")?.label).toBe("yes");
+    expect(labelled.find((e) => e.id === "e3")?.label).toBe("Draft");
   });
 });

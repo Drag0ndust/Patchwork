@@ -15,16 +15,20 @@ import {
 // it: the compiler emits it, and validation asks it whether the graph can be
 // followed at all. `workflow-order` depends on this module for types only, so the
 // two never touch each other's bindings while either is still evaluating.
-import { nestingDepth, planWorkflow } from "./workflow-order";
+import { fanInInputs, nestingDepth, planWorkflow } from "./workflow-order";
+import type { WorkflowPlan } from "./workflow-order";
 
 /**
- * Bumped to 4 in slice 4: the `conditional` node type, whose labelled branches
- * let the workflow fan out, and the `branch` field an edge leaving one carries.
- * (3 recorded, per `skill`/`agent` node, *how* it is exported — referenced by
- * name, or vendor-copied into the bundle.) `deserialize` migrates older
- * documents forward.
+ * Bumped to 5 in slices 5 and 7: a `conditional` node can be **rule-based** (the
+ * `rule` its `mode` selects, evaluated by the exported control scaffold rather
+ * than by the model), and an edge can carry the `inputLabel` its result arrives
+ * under where several paths fan in.
+ *
+ * (4 added the `conditional` node type and an edge's `branch`; 3 recorded, per
+ * `skill`/`agent` node, *how* it is exported — referenced by name, or
+ * vendor-copied into the bundle.) `deserialize` migrates older documents forward.
  */
-export const CURRENT_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = 5;
 
 /** The oldest document version that still opens (via forward migration). */
 export const MIN_SUPPORTED_SCHEMA_VERSION = 1;
@@ -117,15 +121,201 @@ export function exportModeOf(data: ArtifactRefData): ExportMode {
 /**
  * How a `conditional` node decides which branch runs.
  *
- * Only `llm` exists in this slice: the umbrella states the decision question and
- * the branches, and the executing model picks one at runtime. The field is here
- * from the start so the rule-based mode of the next slice is an added variant
- * rather than a second schema — a document is read by asking
- * [`conditionalModeOf`], never by testing for a field's absence.
+ * - `llm` — the umbrella states the decision question and the branches, and the
+ *   executing model picks one at run time. Best-effort by construction.
+ * - `rule` — the node carries a [`ConditionalRule`], the exported control
+ *   scaffold evaluates it, and the model follows the branch the scaffold names.
+ *   Deterministic: the same measured value always routes the same way.
+ *
+ * A document is read by asking [`conditionalModeOf`], never by testing for a
+ * field's absence, which is what made adding `rule` a widening rather than a
+ * second schema (ADR-0003, decision 2).
  */
-export type ConditionalMode = "llm";
+export type ConditionalMode = "llm" | "rule";
 
-const CONDITIONAL_MODES: ConditionalMode[] = ["llm"];
+const CONDITIONAL_MODES: ConditionalMode[] = ["llm", "rule"];
+
+/**
+ * How a rule compares the value it is given against the value the author wrote.
+ *
+ * Deliberately small, and every one of them is something a POSIX shell can decide
+ * without interpreting anything: three string comparisons and two integer ones.
+ * A regular-expression operator was considered and left out — the scaffold would
+ * have to carry a pattern language whose behaviour differs between `grep`
+ * implementations, which is exactly the kind of "deterministic" that is not.
+ */
+export type RuleOperator =
+  | "equals"
+  | "not-equals"
+  | "contains"
+  | "greater-than"
+  | "less-than";
+
+const RULE_OPERATORS: RuleOperator[] = [
+  "equals",
+  "not-equals",
+  "contains",
+  "greater-than",
+  "less-than",
+];
+
+/** The operators whose two sides must be whole numbers. */
+export const NUMERIC_RULE_OPERATORS: RuleOperator[] = ["greater-than", "less-than"];
+
+/**
+ * The operand as it is actually compared — **the one place whitespace is decided**.
+ *
+ * `validateGraph` checks this string and the Graph Compiler emits this string, so the
+ * scaffold cannot be handed an operand the validator never approved. That is not a tidiness
+ * rule: the two used to normalize separately, and a numeric rule written as `" 5"` passed
+ * validation, compiled to `operand=' 5'`, and then refused to route on every shell — a
+ * document the app called exportable producing a bundle that could not take that branch.
+ * A second spelling of "trim" is what made that possible, so there is exactly one.
+ *
+ * It is **operator-aware**, which is why it cannot simply be `trim()` at either end:
+ *
+ * - for a numeric comparison, padding is not part of a magnitude, so it goes. The shell
+ *   would reject it as a non-digit, and a user typing a space is not asking for anything;
+ * - for a string comparison, padding **is** the data. `contains " x "` looks for a spaced
+ *   `x`, and trimming it would silently change what the workflow searches for.
+ *
+ * Emptiness is decided on the trimmed value either way (see `ruleErrors`): an operand of
+ * nothing but whitespace is nothing to compare against, whichever comparison is asked for.
+ */
+export function comparedOperand(rule: ConditionalRule): string {
+  const operand = rule.operand ?? "";
+  return NUMERIC_RULE_OPERATORS.includes(rule.operator) ? operand.trim() : operand;
+}
+
+/**
+ * The rule after the user changes **which comparison it makes**.
+ *
+ * The operand is re-normalized to what was being compared *before* the change, which is
+ * the one thing the user has actually seen. Without this, padding that a numeric
+ * comparison ignored became data the moment the comparison became a string one: a rule
+ * authored as `greater-than " 5"` (a space pasted in from a log line, harmless, validated,
+ * routed correctly) turned into `equals " 5"` on a dropdown change alone — still valid,
+ * still unwarned, rendering identically on the canvas because HTML collapses whitespace —
+ * and then routed a measured `5` to the **false** branch at exit 0. A wrong branch with a
+ * successful exit is the one failure the refusal contract cannot catch, in the mode whose
+ * whole point is that the decision is not a judgement.
+ *
+ * So the invariant is: **the operand's effective meaning never changes unless the user
+ * changes it.** Switching from a numeric comparison stores the trimmed value, because
+ * trimmed is what was compared; switching from a string one stores it verbatim, for the
+ * same reason. Where padding *is* semantic it is now also visible — see [`describeRule`]
+ * and the dock's note.
+ */
+export function withOperator(
+  rule: ConditionalRule,
+  operator: RuleOperator,
+): ConditionalRule {
+  return { ...rule, operator, operand: comparedOperand(rule) };
+}
+
+/**
+ * How each comparison is written where a rule is *shown* rather than evaluated.
+ *
+ * One definition, because two surfaces read it — the canvas node's summary and the dock
+ * — and a user matching what the node says against what the dock offers must not be
+ * looking at two vocabularies. The exported scaffold does not use it: there the operator
+ * is a keyword a shell compares, not a phrase a person reads.
+ */
+export const RULE_OPERATOR_SYMBOLS: Record<RuleOperator, string> = {
+  equals: "=",
+  "not-equals": "≠",
+  contains: "contains",
+  "greater-than": ">",
+  "less-than": "<",
+};
+
+/**
+ * A rule as one line, for a canvas node that has room for one.
+ *
+ * It shows [`comparedOperand`] rather than the stored field — what is compared is what a
+ * reader needs — and **quotes a string operand**, always. The quotes are not decoration:
+ * a string comparison keeps its whitespace, this line is rendered as HTML, and HTML
+ * collapses whitespace runs, so ` 5` and `5` (and `a  b` and `a b`) were the same pixels.
+ * A rule whose meaning cannot be read off the canvas is a rule the author cannot check.
+ *
+ * Quoting *every* string operand rather than only a padded one also makes the two kinds of
+ * comparison tell themselves apart at a glance, and means there is no threshold to get
+ * subtly wrong. A numeric operand is never quoted: it has been trimmed to digits, so there
+ * is nothing left to hide.
+ */
+export function describeRule(rule: ConditionalRule): string {
+  const operand = comparedOperand(rule);
+  const shown = NUMERIC_RULE_OPERATORS.includes(rule.operator) ? operand : `"${operand}"`;
+  return `${rule.subject} ${RULE_OPERATOR_SYMBOLS[rule.operator] ?? rule.operator} ${shown}`.trim();
+}
+
+/** The default a freshly made rule starts from. */
+export const DEFAULT_RULE_OPERATOR: RuleOperator = "equals";
+
+/**
+ * The deterministic check a rule-based `conditional` routes by.
+ *
+ * The split of labour is the point, and it is what "hybrid determinism" means
+ * here (ADR-0004): the **model measures** the `subject` — it is the only party
+ * that can read the work so far — and the **scaffold decides**, because a
+ * comparison is the part that must not vary. So `subject` is prose (like a
+ * `Prompt` instruction) while everything else is data a shell script evaluates.
+ *
+ * `whenTrue`/`whenFalse` are [`Branch.id`]s rather than positions, for the reason
+ * an edge names a branch by id (ADR-0003): reordering or relabelling a branch is
+ * an ordinary edit and must not silently invert a routing.
+ */
+export interface ConditionalRule {
+  /** What the executing model must measure and hand to the scaffold. */
+  subject: string;
+  operator: RuleOperator;
+  /** What the measured value is compared against. */
+  operand: string;
+  /** The branch taken when the comparison holds. */
+  whenTrue: string;
+  /** The branch taken when it does not. */
+  whenFalse: string;
+}
+
+/** True when `value` is a whole number, whatever its magnitude. */
+export function isWholeNumber(value: string): boolean {
+  return /^[+-]?\d+$/.test(value.trim());
+}
+
+/**
+ * How many digits a number in a rule may have.
+ *
+ * The exported scaffold compares numbers with `[ -gt ]`, i.e. with whatever integer type
+ * the shell running the bundle happens to use. POSIX guarantees a signed long, and the
+ * smallest signed long a conforming implementation may have is 32 bits — so ±2147483647
+ * is the widest range that is *guaranteed* to mean the same thing everywhere, and nine
+ * digits is the largest whole number of digits inside it.
+ *
+ * Stated as a digit count rather than as a maximum value on purpose: it is the form the
+ * scaffold can check without doing arithmetic, so the range check itself cannot overflow
+ * the very type it is protecting.
+ *
+ * Past this bound the failure is silent and shell-dependent, which is the one thing the
+ * deterministic mode may not be. A 23-digit measured value made `[` fail with "integer
+ * expression expected"; the failure was swallowed by the `if` asking the question, and
+ * dash, bash and macOS `sh` answered "false" while ksh answered "true" — the same bundle,
+ * the same input, opposite branches. Both sides of every comparison are therefore bounded:
+ * the operand here, at authoring time, and the measured value by the scaffold at run time.
+ */
+export const MAX_RULE_NUMBER_DIGITS = 9;
+
+/**
+ * True when `value` is a whole number every shell compares the same way — see
+ * [`MAX_RULE_NUMBER_DIGITS`].
+ *
+ * Leading zeros are padding rather than magnitude, so they are stripped before the digits
+ * are counted: `0000000009` is nine, not ten.
+ */
+export function isComparableNumber(value: string): boolean {
+  if (!isWholeNumber(value)) return false;
+  const digits = value.trim().replace(/^[+-]/, "").replace(/^0+(?=\d)/, "");
+  return digits.length <= MAX_RULE_NUMBER_DIGITS;
+}
 
 /**
  * LLM-based branching is the default (and, today, the only mode), so a
@@ -150,8 +340,16 @@ export interface Branch {
 export interface ConditionalData {
   /** Optional on the *type* only — read it through [`conditionalModeOf`]. */
   mode?: ConditionalMode;
-  /** What the executing model has to decide, in the user's own words. */
+  /** What the executing model has to decide, in the user's own words (`llm` mode). */
   question: string;
+  /**
+   * The deterministic check (`rule` mode).
+   *
+   * Kept when the node is switched back to `llm` rather than deleted, so toggling
+   * the mode to look at the other one does not cost the user what they wrote —
+   * which is why an ignored rule is not a validation error.
+   */
+  rule?: ConditionalRule;
   branches: Branch[];
 }
 
@@ -210,6 +408,42 @@ export interface GraphEdge {
    * truth.
    */
   branch?: string;
+  /**
+   * What this edge's result is called where it arrives.
+   *
+   * An edge carries a node's output into the next node as context, and where
+   * several edges fan into one node those results are concatenated **under their
+   * labels** so the consuming step can tell them apart. The label sits on the
+   * edge for the same reason the branch does (ADR-0003, and ADR-0005 for this field):
+   * the edge is the thing the user draws and the thing the traversal follows.
+   *
+   * Optional, because the label an edge carries by default is already on the
+   * canvas — the source node's own label. Read it through [`inputLabelOf`], never
+   * by testing for the field.
+   */
+  inputLabel?: string;
+}
+
+/**
+ * What an edge's result is called where it arrives: the label the author gave the
+ * edge, else the source node's label, else the source node's id.
+ *
+ * The fallback chain is what keeps fan-in labels a thing the user *reads off the
+ * canvas* rather than a second set of names to maintain: naming the nodes is
+ * already how a graph is made legible, and an edge label is the override for when
+ * one node feeds two different things into one step.
+ */
+export function inputLabelOf(
+  // Structural rather than the whole node and edge, because the canvas asks this of its
+  // *React Flow* edge and node, which carry the same two fields under other names: one
+  // rule, asked in both places, instead of a canvas copy of it (see `withInputLabels`).
+  edge: Pick<GraphEdge, "source"> & { inputLabel?: string },
+  source: { label?: string } | undefined,
+): string {
+  const explicit = (edge.inputLabel ?? "").trim();
+  if (explicit !== "") return explicit;
+  const derived = (source?.label ?? "").trim();
+  return derived !== "" ? derived : edge.source;
 }
 
 export interface WorkflowMeta {
@@ -390,6 +624,7 @@ export function validateGraph(doc: PatchworkDocument): ValidationResult {
 
   errors.push(...contentErrors(doc));
   errors.push(...branchWiringErrors(doc, nodeIds));
+  errors.push(...inputLabelErrors(doc));
 
   // Checked here, ahead of the plan, because everything below is a function of the size and
   // the plan is the most expensive of them. See [`MAX_WORKFLOW_NODES`].
@@ -412,6 +647,10 @@ export function validateGraph(doc: PatchworkDocument): ValidationResult {
   if (structure.walkable && !tooLarge) {
     const plan = planWorkflow(doc);
     errors.push(...plan.problems);
+    // Asked of the plan `compile` walks, and of the one already built here: whether two
+    // results arrive at a step *together* is a fact about the traversal (see
+    // `fanInInputs`), so it can only be answered once the graph can be followed at all.
+    errors.push(...fanInErrors(doc, plan));
     const depth = nestingDepth(plan);
     if (depth > MAX_BRANCH_NESTING_DEPTH) {
       errors.push(
@@ -461,6 +700,15 @@ const BRANCH_LABEL_PATTERN = PARAM_NAME_PATTERN;
  * repeat exactly; a paragraph is not a choice.
  */
 export const MAX_BRANCH_LABEL_LENGTH = MAX_NAME_SEGMENT_LENGTH;
+
+/**
+ * An input label lands in the same place a branch label does — an inline code span
+ * in the umbrella, which the reading model has to quote back to itself while it
+ * assembles a step's context — so it shares both rules rather than inventing a
+ * second pair.
+ */
+const INPUT_LABEL_PATTERN = PARAM_NAME_PATTERN;
+export const MAX_INPUT_LABEL_LENGTH = MAX_NAME_SEGMENT_LENGTH;
 
 /**
  * How deeply conditionals may nest — a conditional inside a branch of another is
@@ -532,6 +780,17 @@ export const MAX_BRANCHES_PER_CONDITIONAL = 64;
  * `validateGraph`, which refuses the export.
  */
 export const MIN_BRANCHES_PER_CONDITIONAL = 2;
+
+/**
+ * How many paths one node may split into.
+ *
+ * The same number, and the same reasoning, as [`MAX_BRANCHES_PER_CONDITIONAL`]: a
+ * split is read as a list of paths to follow, the umbrella writes one nested
+ * sub-list per path, and the canvas draws an edge each. It is also what keeps the
+ * **edge** count of an accepted document bounded now that any node may fan out —
+ * without it, `MAX_WORKFLOW_NODES` bounds only the nodes.
+ */
+export const MAX_FAN_OUT = MAX_BRANCHES_PER_CONDITIONAL;
 
 /**
  * The branches every surface shows when a node holds more than the limit.
@@ -609,14 +868,20 @@ function contentErrors(doc: PatchworkDocument): string[] {
 function conditionalErrors(node: GraphNode): string[] {
   const errors: string[] = [];
   const data = node.data as ConditionalData;
+  const mode = conditionalModeOf(data);
 
-  if ((data.question ?? "").trim() === "") {
+  // Only what the node's own mode reads. A rule-based conditional states its check
+  // instead of a question, and demanding both would ask the user to write prose
+  // nothing emits; the *unused* field is kept rather than validated, so switching
+  // modes to look at the other one is free.
+  if (mode === "llm" && (data.question ?? "").trim() === "") {
     errors.push(
       `Conditional node '${node.id}' has an empty decision question; the exported skill has nothing to decide from`,
     );
   }
 
   const branches = branchesOf(node);
+  if (mode === "rule") errors.push(...ruleErrors(node, data, branches));
   if (branches.length < MIN_BRANCHES_PER_CONDITIONAL) {
     errors.push(
       `Conditional node '${node.id}' must offer at least two branches to choose between (found ${branches.length})`,
@@ -673,6 +938,147 @@ function conditionalErrors(node: GraphNode): string[] {
     }
   }
 
+  return errors;
+}
+
+/**
+ * Reject a rule the control scaffold could not evaluate, or could not route.
+ *
+ * Every rule here is about the *script the compiler will emit*, the way
+ * [`conditionalErrors`] is about the prose: the scaffold compares one value against
+ * one operand and prints one of two branch labels, so a missing subject leaves the
+ * model nothing to measure, a non-numeric operand makes an integer test a runtime
+ * error rather than a decision, and a routing that names a branch the node does not
+ * offer prints a label nothing in the umbrella answers to.
+ *
+ * Exactly two branches, because a rule *holds or it does not*. A third branch would
+ * be one the scaffold can never name — and an unreachable path in a workflow whose
+ * whole selling point is determinism is worse than a refused document.
+ */
+function ruleErrors(
+  node: GraphNode,
+  data: ConditionalData,
+  branches: readonly Branch[],
+): string[] {
+  const rule = data.rule;
+  if (rule === undefined) {
+    return [
+      `Conditional node '${node.id}' is rule-based but has no rule; give it a check the control scaffold can evaluate, or switch it back to LLM-based`,
+    ];
+  }
+
+  const errors: string[] = [];
+  if ((rule.subject ?? "").trim() === "") {
+    errors.push(
+      `Conditional node '${node.id}' has a rule with no subject; the control scaffold needs to be told which value to check`,
+    );
+  }
+  // Blank is blank whatever the comparison; everything past that is asked of the operand
+  // as it will actually be compared, which is the string the compiler emits.
+  const operand = comparedOperand(rule);
+  if (operand.trim() === "") {
+    errors.push(
+      `Conditional node '${node.id}' has a rule with nothing to compare against; give it a value`,
+    );
+  } else if (NUMERIC_RULE_OPERATORS.includes(rule.operator)) {
+    if (!isWholeNumber(operand)) {
+      errors.push(
+        `Conditional node '${node.id}' compares '${rule.operator}' against '${rule.operand}', which is not a whole number; a numeric rule needs one`,
+      );
+    } else if (!isComparableNumber(operand)) {
+      // A separate error from "not a number", because it has a separate cause and a
+      // separate fix: the value *is* a number, it is simply one no shell agrees about.
+      errors.push(
+        `Conditional node '${node.id}' compares '${rule.operator}' against '${rule.operand}', which has more than ${MAX_RULE_NUMBER_DIGITS} digits; a rule is compared by a shell, and only numbers up to ${"9".repeat(MAX_RULE_NUMBER_DIGITS)} compare the same way in every shell`,
+      );
+    }
+  }
+
+  if (branches.length !== 2) {
+    errors.push(
+      `Conditional node '${node.id}' is rule-based and offers ${branches.length} branches; a rule holds or it does not, so it decides between exactly two`,
+    );
+  }
+
+  const offered = new Map(branches.map((branch) => [branch?.id, branch]));
+  for (const [outcome, branchId] of [
+    ["true", rule.whenTrue],
+    ["false", rule.whenFalse],
+  ] as const) {
+    if (!offered.has(branchId)) {
+      errors.push(
+        `Conditional node '${node.id}' routes its rule's ${outcome} case to branch '${branchId}', which that node does not offer`,
+      );
+    }
+  }
+  if (rule.whenTrue === rule.whenFalse && offered.has(rule.whenTrue)) {
+    errors.push(
+      `Conditional node '${node.id}' routes both cases of its rule to branch '${offered.get(rule.whenTrue)?.label}'; a rule chooses between two paths`,
+    );
+  }
+
+  return errors;
+}
+
+/**
+ * Reject an input label the step that reads it could not quote.
+ *
+ * A property of the edge alone, so it is checked for **every** edge and without the plan:
+ * a label is written before the graph it belongs to is finished, and "your label has a
+ * backtick in it" should not wait on the document becoming walkable.
+ */
+function inputLabelErrors(doc: PatchworkDocument): string[] {
+  const errors: string[] = [];
+  for (const edge of doc.edges) {
+    const label = (edge.inputLabel ?? "").trim();
+    if (label === "") continue;
+    if (!INPUT_LABEL_PATTERN.test(label)) {
+      errors.push(
+        `Edge ${edge.id} carries input label '${edge.inputLabel}' with invalid characters (use letters, digits, spaces, hyphens, or underscores)`,
+      );
+    }
+    if (label.length > MAX_INPUT_LABEL_LENGTH) {
+      errors.push(
+        `Edge ${edge.id} carries an input label of ${label.length} characters; it is quoted in the step that reads it, so it must be at most ${MAX_INPUT_LABEL_LENGTH} characters`,
+      );
+    }
+  }
+  return errors;
+}
+
+/**
+ * Reject a fan-in whose inputs the consuming step could not tell apart.
+ *
+ * A fan-in step's context is its upstream results **concatenated under their labels**, so
+ * two inputs sharing a label is not a naming quibble: it is a step that cannot say which
+ * result it is looking at. Compared case-folded and trimmed for the reason branch labels
+ * are — the comparison that matters is the one a *reader* makes.
+ *
+ * **Which edges those are is [`fanInInputs`]' to say, not this function's**, and that is
+ * the whole point of asking the plan rather than the edge list. The first spelling of this
+ * check excluded only the edges that leave a conditional *directly*, and so refused an
+ * ordinary two-branch workflow: once a branch has a step of its own, the edge arriving at
+ * the convergence point carries no branch any more, and two branch bodies whose steps
+ * happen to share a label ("Draft" in both) read as an ambiguous fan-in. They are not one
+ * — only one branch ever runs, so only one result ever arrives — and the compiler already
+ * knew it, because it asks the plan. Now both do, and they cannot disagree about what a
+ * step reads.
+ */
+function fanInErrors(doc: PatchworkDocument, plan: WorkflowPlan): string[] {
+  const errors: string[] = [];
+  for (const [target, inputs] of fanInInputs(doc, plan)) {
+    const seen = new Set<string>();
+    for (const input of inputs) {
+      const folded = input.label.toLowerCase();
+      if (seen.has(folded)) {
+        errors.push(
+          `Node '${target}' has two incoming paths labelled '${input.label}'; label the edges or rename the nodes so the step can tell its inputs apart`,
+        );
+      } else {
+        seen.add(folded);
+      }
+    }
+  }
   return errors;
 }
 
@@ -819,17 +1225,18 @@ interface StructureVerdict {
  * Enforce that the graph runs from the one Input to the one Output with no orphans
  * and no cycles, and that it fans out only where a fan-out means something.
  *
- * Slice 1 was linear-only. Slice 4 relaxes exactly two things:
+ * Slice 1 was linear-only. Slice 4 relaxed the shape and slice 7 finished the job:
  *
- * - **Fan-out** is allowed at a `conditional` node and nowhere else; how many
- *   edges it has is governed by its branches (see [`branchWiringErrors`]).
- * - **Fan-in** is no longer checked at all, because it is now what re-convergence
- *   looks like — and it cannot occur *without* a conditional: with every other node
- *   limited to one outgoing edge, two edges into one node would need a second path
- *   out of some node, and the only way to reach a merge twice in a fan-out-free
- *   graph is a cycle, which is still rejected below. Whether the merge is a
- *   *legitimate* convergence point is decided by the plan check in `validateGraph`,
- *   which asks the same traversal the compiler walks.
+ * - **Fan-out** is allowed at any node, because there are now two kinds of it and both
+ *   are followable — a conditional runs exactly one of its paths, a plain split runs
+ *   all of them (ADR-0005). Only the *width* is refused, at [`MAX_FAN_OUT`]; a
+ *   conditional's width is governed by its branches instead (see
+ *   [`branchWiringErrors`]).
+ * - **Fan-in** is not a structural error either: it is what re-convergence looks like
+ *   after a conditional, and what a split's paths coming back together looks like.
+ *   Whether the merge is a *legitimate* convergence point is decided by the plan check
+ *   in `validateGraph`, which asks the same traversal the compiler walks; whether its
+ *   inputs can be told apart is [`fanInErrors`]'.
  *
  * The "leads somewhere" rule is new and belongs to fan-out: in a chain, one Output
  * plus connectivity already forced every node to lead on, but a branch can now end
@@ -856,9 +1263,13 @@ function structureErrors(
   for (const node of doc.nodes) {
     const out = outDeg.get(node.id) ?? 0;
     const inc = inDeg.get(node.id) ?? 0;
-    if (out > 1 && node.type !== "conditional") {
+    // A plain split is a fan-out where *every* path is followed; a conditional is
+    // one where exactly one is. Both are followable, so neither is refused — only
+    // the width is, and a conditional's width is governed by its branches instead
+    // (see [`branchWiringErrors`] and [`conditionalErrors`]).
+    if (out > MAX_FAN_OUT && node.type !== "conditional") {
       errors.push(
-        `Node '${node.id}' has ${out} outgoing edges; only a Conditional node may branch`,
+        `Node '${node.id}' splits into ${out} paths; at most ${MAX_FAN_OUT} can be written as a list a reader could follow. Merge some of them before splitting again.`,
       );
     }
     if (out === 0 && node.type !== "output") {
@@ -1042,6 +1453,11 @@ const MIGRATIONS: Record<number, (doc: PatchworkDocument) => PatchworkDocument> 
   // fields changed shape — so a v3 document is already a valid v4 document, and the
   // migration only records the version it now opens at.
   3: (doc) => ({ ...doc, schemaVersion: 4 }),
+  // v4 -> v5: the `rule` conditional mode with the rule it selects, and an edge's
+  // `inputLabel`. Widenings again — a v4 conditional has no `mode` or an `llm` one,
+  // which is exactly what it still means, and no v4 edge carries an input label — so
+  // a v4 document is already a valid v5 document.
+  4: (doc) => ({ ...doc, schemaVersion: 5 }),
 };
 
 function migrateToCurrent(doc: PatchworkDocument): PatchworkDocument {
@@ -1205,8 +1621,38 @@ function assertNodeShape(raw: unknown, index: number): void {
           `Conditional node '${id}' has an invalid 'mode' '${String(data.mode)}' (expected one of ${CONDITIONAL_MODES.join(", ")})`,
         );
       }
+      // The rule's *shape*, for the same reason every other `data` contract is checked
+      // here: `validateGraph` and the scaffold emitter both read these fields as
+      // strings, and a number or an object would surface as a TypeError far from the
+      // file that caused it. Whether the rule makes sense is `validateGraph`'s.
+      if (data.rule !== undefined) assertRuleShape(id, data.rule);
       break;
     }
+  }
+}
+
+/** Reject a rule whose fields the scaffold emitter could not render. */
+function assertRuleShape(id: string, raw: unknown): void {
+  if (typeof raw !== "object" || raw === null) {
+    throw new Error(
+      `Conditional node '${id}' must have a 'rule' object (found ${describeType(raw)})`,
+    );
+  }
+  const rule = raw as Record<string, unknown>;
+  for (const field of ["subject", "operand", "whenTrue", "whenFalse"] as const) {
+    if (typeof rule[field] !== "string") {
+      throw new Error(
+        `Conditional node '${id}' must have a string '${field}' in its rule (found ${describeType(rule[field])})`,
+      );
+    }
+  }
+  // An unknown operator is refused rather than defaulted, the way an unknown export
+  // mode is: guessing which comparison the author meant would decide the routing of
+  // a workflow on their behalf, and this is the mode whose promise is determinism.
+  if (!RULE_OPERATORS.includes(rule.operator as RuleOperator)) {
+    throw new Error(
+      `Conditional node '${id}' has a rule with an invalid 'operator' '${String(rule.operator)}' (expected one of ${RULE_OPERATORS.join(", ")})`,
+    );
   }
 }
 
@@ -1251,4 +1697,7 @@ function assertEdgeShape(raw: unknown, index: number): void {
   // whether the named branch exists is `validateGraph`'s business, because a
   // document may legitimately be opened while it is still being wired up.
   assertOptionalText(edge.branch, `edge at index ${index} 'branch'`);
+  // Likewise for what the edge's result is called where it arrives: the type is the
+  // load boundary's business, the charset and the length are `validateGraph`'s.
+  assertOptionalText(edge.inputLabel, `edge at index ${index} 'inputLabel'`);
 }

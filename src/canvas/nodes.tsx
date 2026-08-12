@@ -1,6 +1,8 @@
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import {
   branchesWithinLimit,
+  conditionalModeOf,
+  describeRule,
   MAX_BRANCHES_PER_CONDITIONAL,
   type ArtifactRefData,
   type ConditionalData,
@@ -121,7 +123,20 @@ export function AgentNode(props: NodeProps<PatchNode>) {
  */
 export function ConditionalNode({ data, selected }: NodeProps<PatchNode>) {
   const conditional = data.node as ConditionalData | undefined;
-  const question = conditional?.question ?? "";
+  // Which of the two decides this branch is the most consequential thing about the node
+  // — a question the executing model judges, or a check the exported control scaffold
+  // evaluates — so it is on the node itself, where a workflow is read, and not only in
+  // the dock, where one node at a time is edited.
+  const mode = conditionalModeOf(conditional ?? { question: "", branches: [] });
+  const rule = conditional?.rule;
+  // A rule with nothing measured yet is "no rule", not the bare comparison it would
+  // summarise to: a node freshly switched to rule-based should read as unfinished.
+  const detail =
+    mode === "rule"
+      ? rule === undefined || (rule.subject ?? "").trim() === ""
+        ? "no rule"
+        : summarize(describeRule(rule))
+      : summarize(conditional?.question ?? "") || "no question";
   const branches = Array.isArray(conditional?.branches) ? conditional.branches : [];
   const overWidth = branches.length > MAX_BRANCHES_PER_CONDITIONAL;
   const drawn = branchesWithinLimit(branches);
@@ -133,9 +148,11 @@ export function ConditionalNode({ data, selected }: NodeProps<PatchNode>) {
       }`}
     >
       <Handle type="target" position={Position.Left} />
-      <header className="pw-node__type">Conditional · LLM</header>
+      <header className="pw-node__type">
+        {mode === "rule" ? "Conditional · Rule" : "Conditional · LLM"}
+      </header>
       <div className="pw-node__label">{data.label || "Untitled conditional"}</div>
-      <div className="pw-node__detail">{summarize(question) || "no question"}</div>
+      <div className="pw-node__detail">{detail}</div>
       <ul className="pw-node__branches">
         {drawn.map((branch) => (
           <li key={branch.id} className="pw-node__branch">

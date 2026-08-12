@@ -18,12 +18,13 @@ import {
 import { ConditionalNode } from "./nodes";
 import type { PatchNode } from "./react-flow-adapter";
 
-function conditionalWith(branches: number) {
+function conditionalWith(branches: number, override: Partial<ConditionalData> = {}) {
   const data: ConditionalData = {
     mode: "llm",
     question: "Which way?",
     // Label = id, so what a row renders can be compared with what an edge's handle names.
     branches: Array.from({ length: branches }, (_, at) => ({ id: `b${at}`, label: `b${at}` })),
+    ...override,
   };
   // React Flow hands its node components a wide props object; only these two are read here.
   const props = {
@@ -96,4 +97,75 @@ describe("ConditionalNode", () => {
 
     expect(performance.now() - started).toBeLessThan(1000);
   });
+});
+
+describe("ConditionalNode — which of the two things decides this branch", () => {
+  it("given_anLlmConditional_whenRendered_thenItSaysTheModelDecidesAndShowsTheQuestion", () => {
+    const { container } = conditionalWith(2);
+
+    expect(screen.getByText("Conditional · LLM")).toBeTruthy();
+    expect(container.querySelector(".pw-node__detail")?.textContent).toBe("Which way?");
+  });
+
+  it("given_aRuleBasedConditional_whenRendered_thenItSaysTheScaffoldDecidesAndShowsTheCheck", () => {
+    // The mode is the difference between a branch the model judges and one the exported
+    // scaffold decides, so it is on the node rather than only in the dock: it changes how
+    // the whole workflow runs, and the canvas is where a workflow is read.
+    conditionalWith(2, {
+      mode: "rule",
+      question: "",
+      rule: {
+        subject: "lines changed",
+        operator: "greater-than",
+        operand: "100",
+        whenTrue: "b0",
+        whenFalse: "b1",
+      },
+    });
+
+    expect(screen.getByText("Conditional · Rule")).toBeTruthy();
+    expect(screen.getByText("lines changed > 100")).toBeTruthy();
+  });
+
+  it("given_aRuleWhosePaddingIsPartOfTheComparison_whenRendered_thenThePaddingIsVisible", () => {
+    // HTML collapses whitespace runs, so an unquoted ` 5` was the same pixels as `5` — the
+    // author could not see, on the canvas, that this rule no longer matched what they
+    // measured. Quoted, the difference is there to read.
+    const { container } = conditionalWith(2, {
+      mode: "rule",
+      question: "",
+      rule: {
+        subject: "the count",
+        operator: "equals",
+        operand: " 5",
+        whenTrue: "b0",
+        whenFalse: "b1",
+      },
+    });
+
+    expect(container.querySelector(".pw-node__detail")?.textContent).toBe(
+      'the count = " 5"',
+    );
+  });
+
+  it.each([
+    ["no rule at all", undefined],
+    [
+      "a rule with nothing measured yet",
+      {
+        subject: "  ",
+        operator: "equals" as const,
+        operand: "",
+        whenTrue: "b0",
+        whenFalse: "b1",
+      },
+    ],
+  ])(
+    "given_aRuleBasedConditionalWith_%s_whenRendered_thenItReadsAsUnfinished",
+    (_case, rule) => {
+      conditionalWith(2, { mode: "rule", question: "", rule });
+
+      expect(screen.getByText("no rule")).toBeTruthy();
+    },
+  );
 });
