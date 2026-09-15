@@ -2309,5 +2309,3 @@ describe("deserialize — forward migration to v5", () => {
     expect(conditionalModeOf(conditional?.data as ConditionalData)).toBe("llm");
   });
 });
-
-
