@@ -4,6 +4,7 @@ import {
   CURRENT_SCHEMA_VERSION,
   MAX_BRANCHES_PER_CONDITIONAL,
   artifactKindOf,
+  inputLabelOf,
   type ArtifactRefData,
   type Branch,
   type ConditionalData,
@@ -52,6 +53,11 @@ export function documentToFlow(doc: PatchworkDocument): FlowGraph {
     // leaves by *is* the handle it comes out of. Absent for every other node,
     // which has a single unnamed source handle.
     sourceHandle: e.branch,
+    // Carried through the canvas rather than derived there: the label an edge was
+    // *given* is the user's, and a round trip through React Flow must not lose it.
+    // What is derived is the label an edge is *shown* with ([`withInputLabels`]),
+    // which falls back to the source node's own label.
+    ...(e.inputLabel === undefined ? {} : { data: { inputLabel: e.inputLabel } }),
   }));
   return { nodes, edges: withBranchLabels(nodes, edges) };
 }
@@ -112,6 +118,80 @@ export function withBranchLabels(
     return { ...edge, label };
   });
   return changed ? labelled : (edges as Edge[]);
+}
+
+/**
+ * Show, on each edge of a fan-in, what that path's result is called where it arrives.
+ *
+ * Derived state, like [`withBranchLabels`], and for the same reason: the default label
+ * is the *source node's*, so renaming a node re-labels the edges leaving it without the
+ * edge list being touched.
+ *
+ * Only where more than one path arrives, deliberately. A single input needs no name —
+ * the consuming step's own instruction says what it works from — and labelling every
+ * edge in every graph would be noise on the shape the labels exist to disambiguate.
+ *
+ * Branch edges are skipped: a branch is an alternative rather than an input, its label
+ * is the branch's, and the two labellers must never land on the same edge.
+ *
+ * What this says is what an edge **carries**, which is a fact about the edge. What a step
+ * *reads* is the Graph Compiler's to decide, and it is a fact about the traversal, so the
+ * two are not the same question and this is not a copy of that rule. The one thing they
+ * must agree on is the name, and that is `inputLabelOf`, which both call.
+ *
+ * **Where they visibly differ, and why that is the trade taken.** At a conditional's
+ * convergence point the compiler emits no fan-in prose — only one branch runs, so only one
+ * result arrives (`fanInInputs`) — while this labels both arriving edges. Each label is
+ * still true: whichever branch was taken, that is what its edge carried and what it is
+ * called. Nothing on the canvas claims the results are concatenated; the sentence that
+ * would say so lives in the umbrella, and the umbrella does not say it.
+ *
+ * Making the canvas answer the compiler's question means planning the document, and this
+ * runs on every canvas change: React Flow hands over a new `nodes` array per frame of a
+ * drag, and a branching document's plan allocates a transitive closure — 8 MB at
+ * `MAX_WORKFLOW_NODES`. That is a graph-sized allocation per frame, i.e. the frozen-window
+ * defect class this codebase treats as a bug, spent to remove two labels that are not
+ * wrong. Memoising it behind a structural signature was considered too: the signature is
+ * itself an O(nodes) pass per render, and it puts a second notion of "has the graph
+ * changed?" in App. Both were rejected; the divergence is pinned by a test so it stays a
+ * decision. See ADR-0005.
+ *
+ * Identity-stable when nothing changed, so the common case allocates nothing.
+ */
+export function withInputLabels(
+  nodes: readonly PatchNode[],
+  edges: readonly Edge[],
+): Edge[] {
+  const arriving = new Map<string, number>();
+  for (const edge of edges) {
+    if (isBranchEdge(edge)) continue;
+    arriving.set(edge.target, (arriving.get(edge.target) ?? 0) + 1);
+  }
+  if (![...arriving.values()].some((count) => count > 1)) return edges as Edge[];
+
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  let changed = false;
+  const labelled = edges.map((edge) => {
+    if (isBranchEdge(edge) || (arriving.get(edge.target) ?? 0) < 2) return edge;
+    const source = byId.get(edge.source);
+    const label = inputLabelOf(
+      {
+        source: edge.source,
+        inputLabel:
+          typeof edge.data?.inputLabel === "string" ? edge.data.inputLabel : undefined,
+      },
+      source === undefined ? undefined : { label: source.data.label },
+    );
+    if (edge.label === label) return edge;
+    changed = true;
+    return { ...edge, label };
+  });
+  return changed ? labelled : (edges as Edge[]);
+}
+
+/** True for an edge that leaves a conditional by one of its branches. */
+function isBranchEdge(edge: Edge): boolean {
+  return edge.sourceHandle !== null && edge.sourceHandle !== undefined && edge.sourceHandle !== "";
 }
 
 /**
@@ -250,6 +330,11 @@ export function flowToDocument(
     id: e.id,
     source: e.source,
     target: e.target,
+    // The label the user gave this edge, if any. Only a non-empty string is written
+    // back, so an edge that never carried one keeps the shape it had.
+    ...(typeof e.data?.inputLabel === "string" && e.data.inputLabel !== ""
+      ? { inputLabel: e.data.inputLabel }
+      : {}),
     // Only a conditional's edges carry a branch. Read off the source handle the
     // user drew from, and only for a conditional source, so a stray handle id on
     // any other node cannot end up in the document as a branch.

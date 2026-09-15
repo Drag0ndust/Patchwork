@@ -9,19 +9,27 @@ import {
   MAX_BRANCH_LABEL_LENGTH,
   MAX_BRANCH_NESTING_DEPTH,
   MAX_BRANCHES_PER_CONDITIONAL,
+  MAX_FAN_OUT,
+  MAX_INPUT_LABEL_LENGTH,
+  MAX_RULE_NUMBER_DIGITS,
   MAX_WORKFLOW_NODES,
   MAX_BUNDLE_DIR_LENGTH,
   MAX_WORKFLOW_NAME_LENGTH,
   type ArtifactRefData,
   type ConditionalData,
+  type ConditionalRule,
   type InputData,
   type PatchworkDocument,
   conditionalModeOf,
   deserialize,
   exportModeOf,
+  inputLabelOf,
   serialize,
   slugify,
   validateGraph,
+  withOperator,
+  comparedOperand,
+  describeRule,
 } from "./graph-document";
 
 function readFixture(relativePath: string): string {
@@ -261,19 +269,14 @@ describe("validateGraph — the bundle directory name has to stay discoverable",
   });
 });
 
-describe("validateGraph — linear-chain enforcement", () => {
-  it("given_extraStrayEdge_whenValidating_thenRejectsBranchingNode", () => {
+describe("validateGraph — connectivity enforcement", () => {
+  it("given_extraStrayEdge_whenValidating_thenTheSplitIsAcceptedAsAFanIn", () => {
     const doc = linearDocument();
-    // n1 -> n2 -> n3 already; add a stray n1 -> n3 so n1 branches, n3 merges.
+    // n1 -> n2 -> n3 already; add a stray n1 -> n3 so n1 splits and n3 merges. Since
+    // labeled fan-in exists, that is a shape with a meaning rather than an error.
     doc.edges.push({ id: "e3", source: "n1", target: "n3" });
 
-    const result = validateGraph(doc);
-
-    expect(result.ok).toBe(false);
-    if (result.ok) throw new Error("expected failure");
-    expect(result.errors).toContain(
-      "Node 'n1' has 2 outgoing edges; only a Conditional node may branch",
-    );
+    expect(validateGraph(doc)).toEqual({ ok: true });
   });
 
   it("given_disconnectedNode_whenValidating_thenRejectsWithActionableError", () => {
@@ -294,7 +297,7 @@ describe("validateGraph — linear-chain enforcement", () => {
     );
   });
 
-  it("given_branchingFromInput_whenValidating_thenRejectsWithActionableError", () => {
+  it("given_aSplitWhoseSecondPathLeadsNowhere_whenValidating_thenRejectsWithActionableError", () => {
     const doc: PatchworkDocument = {
       schemaVersion: CURRENT_SCHEMA_VERSION,
       workflow: { name: "Branch", description: "d" },
@@ -316,7 +319,7 @@ describe("validateGraph — linear-chain enforcement", () => {
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("expected failure");
     expect(result.errors).toContain(
-      "Node 'i' has 2 outgoing edges; only a Conditional node may branch",
+      "Node 'p2' has no outgoing edge; every node except the Output node must lead somewhere",
     );
   });
 
@@ -1138,13 +1141,13 @@ describe("validateGraph — a conditional's outgoing edges carry its branches", 
 });
 
 describe("validateGraph — a branching graph still has to be followable", () => {
-  it("given_aNonConditionalNodeWithTwoOutgoingEdges_whenValidating_thenRejectsWithActionableError", () => {
+  it("given_aNonConditionalNodeThatSplitsAroundAConditional_whenValidating_thenTheSplitIsAccepted", () => {
+    // A plain split runs *every* path; a conditional runs exactly one. Both fan out, and
+    // both are followable, so the rule that only a conditional may fan out is gone.
     const doc = conditionalDocument();
     doc.edges.push({ id: "e8", source: "n2", target: "n5" });
 
-    expect(errorsOf(doc)).toContain(
-      "Node 'n2' has 2 outgoing edges; only a Conditional node may branch",
-    );
+    expect(validateGraph(doc)).toEqual({ ok: true });
   });
 
   it("given_aNodeThatLeadsNowhere_whenValidating_thenRejectsWithActionableError", () => {
@@ -1716,5 +1719,593 @@ describe("validateGraph — how many branches one conditional may offer", () => 
     const doc = wideConditional(MAX_BRANCHES_PER_CONDITIONAL);
 
     expect(deserialize(JSON.stringify(doc))).toEqual(doc);
+  });
+});
+
+/**
+ * The canonical rule-based conditional: the same triage graph, decided by a check the
+ * control scaffold evaluates rather than by the model reading a question.
+ */
+function ruleConditionalDocument(): PatchworkDocument {
+  const doc = conditionalDocument();
+  const conditional = conditionalOf(doc);
+  conditional.mode = "rule";
+  conditional.question = "";
+  conditional.rule = {
+    subject: "the number of stack frames in the report",
+    operator: "greater-than",
+    operand: "0",
+    whenTrue: "b1",
+    whenFalse: "b2",
+  };
+  return doc;
+}
+
+describe("validateGraph — rule-based conditional nodes", () => {
+  it("given_aRuleBasedConditional_whenValidating_thenReturnsOk", () => {
+    expect(validateGraph(ruleConditionalDocument())).toEqual({ ok: true });
+  });
+
+  it("given_aRuleBasedConditionalWithNoQuestion_whenValidating_thenTheQuestionIsNotRequired", () => {
+    // The question is the *LLM* mode's decision text. A rule states its own check, so
+    // demanding a question too would ask the user to write prose nothing reads.
+    expect(
+      errorsOf({
+        ...ruleConditionalDocument(),
+        workflow: { name: "", description: "" },
+      }).some((e) => e.includes("empty decision question")),
+    ).toBe(false);
+  });
+
+  it("given_aRuleBasedConditionalWithoutARule_whenValidating_thenRejectsWithActionableError", () => {
+    const doc = ruleConditionalDocument();
+    delete conditionalOf(doc).rule;
+
+    expect(errorsOf(doc)).toContain(
+      "Conditional node 'c1' is rule-based but has no rule; give it a check the control scaffold can evaluate, or switch it back to LLM-based",
+    );
+  });
+
+  it("given_aRuleWithNoSubject_whenValidating_thenRejectsWithActionableError", () => {
+    const doc = ruleConditionalDocument();
+    (conditionalOf(doc).rule as ConditionalRule).subject = "   ";
+
+    expect(errorsOf(doc)).toContain(
+      "Conditional node 'c1' has a rule with no subject; the control scaffold needs to be told which value to check",
+    );
+  });
+
+  it("given_aRuleWithAnEmptyOperand_whenValidating_thenRejectsWithActionableError", () => {
+    const doc = ruleConditionalDocument();
+    (conditionalOf(doc).rule as ConditionalRule).operand = "";
+
+    expect(errorsOf(doc)).toContain(
+      "Conditional node 'c1' has a rule with nothing to compare against; give it a value",
+    );
+  });
+
+  it.each(["greater-than", "less-than"] as const)(
+    "given_a_%s_ruleComparedAgainstSomethingThatIsNotANumber_whenValidating_thenRejectsWithActionableError",
+    (operator) => {
+      const doc = ruleConditionalDocument();
+      const rule = conditionalOf(doc).rule as ConditionalRule;
+      rule.operator = operator;
+      rule.operand = "a few";
+
+      expect(errorsOf(doc)).toContain(
+        `Conditional node 'c1' compares '${operator}' against 'a few', which is not a whole number; a numeric rule needs one`,
+      );
+    },
+  );
+
+  it.each([
+    ["greater-than", "99999999999999999999"],
+    ["less-than", "-99999999999999999999"],
+  ] as const)(
+    "given_a_%s_ruleComparedAgainstANumberNoShellAgreesAbout_whenValidating_thenRejectsWithActionableError",
+    (operator, operand) => {
+      // A number past what a shell compares reliably is not a comparison at all: `[ -gt ]`
+      // fails on it, the failure is swallowed by the `if` that asks it, and the answer that
+      // comes out differs between shells. Refused here so an unroutable bundle cannot be
+      // exported — see the scaffold's own guard for the other side of the comparison.
+      const doc = ruleConditionalDocument();
+      const rule = conditionalOf(doc).rule as ConditionalRule;
+      rule.operator = operator;
+      rule.operand = operand;
+
+      expect(errorsOf(doc)).toContain(
+        `Conditional node 'c1' compares '${operator}' against '${operand}', which has more than ${MAX_RULE_NUMBER_DIGITS} digits; a rule is compared by a shell, and only numbers up to ${"9".repeat(MAX_RULE_NUMBER_DIGITS)} compare the same way in every shell`,
+      );
+    },
+  );
+
+  it.each([
+    ["the largest comparable number", "9".repeat(MAX_RULE_NUMBER_DIGITS), true],
+    ["its negative", `-${"9".repeat(MAX_RULE_NUMBER_DIGITS)}`, true],
+    ["one digit more", "1".padEnd(MAX_RULE_NUMBER_DIGITS + 1, "0"), false],
+    // Leading zeros are padding, not magnitude: the value is what is compared.
+    ["a padded number inside the range", `000000${"9".repeat(MAX_RULE_NUMBER_DIGITS)}`, true],
+  ])(
+    "given_aNumericRuleComparedAgainst_%s_whenValidating_thenTheRangeVerdictIs_%s",
+    (_case, operand, accepted) => {
+      const doc = ruleConditionalDocument();
+      (conditionalOf(doc).rule as ConditionalRule).operand = operand;
+
+      const result = validateGraph(doc);
+
+      expect(result.ok).toBe(accepted);
+      expect(result.ok || result.errors.some((e) => e.includes("digits"))).toBe(true);
+    },
+  );
+
+  it.each([
+    ["equals", "   "],
+    ["contains", " \t "],
+    ["not-equals", "\n"],
+  ] as const)(
+    "given_a_%s_ruleComparedAgainstNothingButWhitespace_whenValidating_thenItIsStillNothingToCompareAgainst",
+    (operator, operand) => {
+      // A string comparison keeps its padding, because padding is data there — but an
+      // operand that is *only* padding is not data, it is an unfinished rule. Emptiness is
+      // therefore decided on the trimmed value whatever the comparison, and this pins it:
+      // deciding it on the verbatim value would export `operand='   '` and route by it.
+      const doc = ruleConditionalDocument();
+      const rule = conditionalOf(doc).rule as ConditionalRule;
+      rule.operator = operator;
+      rule.operand = operand;
+
+      expect(errorsOf(doc)).toContain(
+        "Conditional node 'c1' has a rule with nothing to compare against; give it a value",
+      );
+    },
+  );
+
+  it.each([
+    // Numeric -> string is the sequence that made padding semantic behind the user's back:
+    // what was compared as `5` must stay `5`.
+    ["greater-than", " 5", "equals", "5"],
+    ["less-than", "\t5\n", "contains", "5"],
+    // Numeric -> numeric normalizes too; nothing about the comparison changes.
+    ["greater-than", " 5", "less-than", "5"],
+    // String -> anything keeps what was being compared, because that is what was visible.
+    ["contains", " x ", "equals", " x "],
+    ["equals", " x ", "greater-than", " x "],
+  ] as const)(
+    "given_a_%s_ruleAgainst_%j_whenTheComparisonBecomes_%s_thenTheOperandIsWhatWasLastCompared",
+    (operator, operand, next, expected) => {
+      const rule: ConditionalRule = {
+        subject: "the count",
+        operator,
+        operand,
+        whenTrue: "b1",
+        whenFalse: "b2",
+      };
+
+      const switched = withOperator(rule, next);
+
+      expect(switched).toEqual({ ...rule, operator: next, operand: expected });
+
+      // The invariant, stated as itself: a switch either compares exactly what it compared
+      // before, or the user is told — never a different comparison, silently. (The one row
+      // that changes what is compared is ` x ` becoming a *number*, which `validateGraph`
+      // refuses outright, so nothing about it is quiet.)
+      const doc = ruleConditionalDocument();
+      conditionalOf(doc).rule = switched;
+      const unchanged = comparedOperand(switched) === comparedOperand(rule);
+      expect(unchanged || !validateGraph(doc).ok).toBe(true);
+    },
+  );
+
+  it("given_aPaddedStringOperand_whenTheComparisonDetoursThroughANumericOneAndBack_thenThePaddingSurvives", () => {
+    // The reviewer's repro. Each switch satisfies the per-step invariant on its own — the
+    // detour keeps the operand, and the return trims what a numeric comparison would have
+    // ignored — but *composed* they delete padding the user typed, within one visible frame
+    // of tapping through the dropdown. A rule that never compared anything (this one is
+    // refused: ` x ` is not a number) has no meaning to normalize towards.
+    const rule: ConditionalRule = {
+      subject: "the label",
+      operator: "contains",
+      operand: " x ",
+      whenTrue: "b1",
+      whenFalse: "b2",
+    };
+
+    const detoured = withOperator(rule, "greater-than");
+    const back = withOperator(detoured, "contains");
+
+    expect(detoured.operand).toBe(" x ");
+    expect(back).toEqual(rule);
+  });
+
+  it("given_anyComparisonRoundTrip_whenTheDetourIsRefused_thenNothingTheUserTypedIsTouched", () => {
+    // The pin has to be on the **composition**, because that is where the loss lives. Two
+    // rules, swept over every pair of comparisons:
+    //
+    // - if the detour is a rule `validateGraph` refuses, nothing was ever compared through
+    //   it, so the operand comes back byte-identical;
+    // - if the detour is valid, what it compared is what comes back — the B3 invariant,
+    //   asserted across a round trip rather than a single step.
+    const operands = [" x ", "x", " 5 ", "5", " 5x ", "0009", " a b "];
+    const comparisons = [
+      "equals",
+      "not-equals",
+      "contains",
+      "greater-than",
+      "less-than",
+    ] as const;
+    const lost: string[] = [];
+
+    for (const from of comparisons) {
+      for (const operand of operands) {
+        const rule: ConditionalRule = {
+          subject: "the label",
+          operator: from,
+          operand,
+          whenTrue: "b1",
+          whenFalse: "b2",
+        };
+        const doc = ruleConditionalDocument();
+        conditionalOf(doc).rule = rule;
+        // Only rules that are themselves usable have a meaning to preserve.
+        if (!validateGraph(doc).ok) continue;
+
+        for (const via of comparisons) {
+          const detoured = withOperator(rule, via);
+          const back = withOperator(detoured, from);
+          const detour = ruleConditionalDocument();
+          conditionalOf(detour).rule = detoured;
+
+          const expected = validateGraph(detour).ok
+            ? comparedOperand(detoured)
+            : operand;
+          if (comparedOperand(back) !== expected) {
+            lost.push(
+              `${from} ${JSON.stringify(operand)} via ${via}: ${JSON.stringify(
+                comparedOperand(back),
+              )} != ${JSON.stringify(expected)}`,
+            );
+          }
+        }
+      }
+    }
+
+    expect(lost).toEqual([]);
+  });
+
+  it.each([
+    ["a numeric comparison", "greater-than", "100", "lines changed > 100"],
+    ["a string comparison", "equals", "closed", 'lines changed = "closed"'],
+    // The case the canvas used to render identically to an unpadded rule, because HTML
+    // collapses whitespace runs: quoted, the padding is there to see.
+    ["a padded string comparison", "equals", " 5", 'lines changed = " 5"'],
+    ["interior padding", "contains", "a  b", 'lines changed contains "a  b"'],
+    // A padded operand under a numeric comparison is a rule the export refuses, and the
+    // padding is why — so the summary shows it rather than rendering as the valid rule it
+    // is not.
+    ["padding a number cannot have", "greater-than", " 5x ", 'lines changed > " 5x "'],
+    // The delimiter is escaped inside the value, so the quoted region has exactly one end
+    // however many quotes the operand contains.
+    ["an operand containing the delimiter", "contains", 'a"b', 'lines changed contains "a\\"b"'],
+    ["an operand containing a backslash", "contains", "a\\b", 'lines changed contains "a\\\\b"'],
+  ] as const)(
+    "given_%s_whenDescribingTheRule_thenWhatIsComparedIsVisible",
+    (_case, operator, operand, expected) => {
+      expect(
+        describeRule({
+          subject: "lines changed",
+          operator,
+          operand,
+          whenTrue: "b1",
+          whenFalse: "b2",
+        }),
+      ).toBe(expected);
+    },
+  );
+
+  it("given_aRuleBasedConditionalWithThreeBranches_whenValidating_thenRejectsWithActionableError", () => {
+    const doc = ruleConditionalDocument();
+    conditionalOf(doc).branches.push({ id: "b3", label: "maybe" });
+    doc.edges.push({ id: "e8", source: "c1", target: "n5", branch: "b3" });
+
+    expect(errorsOf(doc)).toContain(
+      "Conditional node 'c1' is rule-based and offers 3 branches; a rule holds or it does not, so it decides between exactly two",
+    );
+  });
+
+  it("given_aRuleRoutedToABranchTheNodeDoesNotOffer_whenValidating_thenRejectsWithActionableError", () => {
+    const doc = ruleConditionalDocument();
+    (conditionalOf(doc).rule as ConditionalRule).whenTrue = "bx";
+
+    expect(errorsOf(doc)).toContain(
+      "Conditional node 'c1' routes its rule's true case to branch 'bx', which that node does not offer",
+    );
+  });
+
+  it("given_aRuleRoutingBothCasesToOneBranch_whenValidating_thenRejectsWithActionableError", () => {
+    const doc = ruleConditionalDocument();
+    (conditionalOf(doc).rule as ConditionalRule).whenFalse = "b1";
+
+    expect(errorsOf(doc)).toContain(
+      "Conditional node 'c1' routes both cases of its rule to branch 'with trace'; a rule chooses between two paths",
+    );
+  });
+
+  it("given_anUnknownConditionalMode_whenDeserializing_thenThrowsActionableError", () => {
+    const doc = ruleConditionalDocument();
+    (conditionalOf(doc) as { mode: string }).mode = "coin-flip";
+
+    expect(() => deserialize(JSON.stringify(doc))).toThrow(
+      /Conditional node 'c1' has an invalid 'mode' 'coin-flip' \(expected one of llm, rule\)/,
+    );
+  });
+
+  it("given_aRuleWithAnUnknownOperator_whenDeserializing_thenThrowsActionableError", () => {
+    const doc = ruleConditionalDocument();
+    (conditionalOf(doc).rule as { operator: string }).operator = "sounds-like";
+
+    expect(() => deserialize(JSON.stringify(doc))).toThrow(
+      /Conditional node 'c1' has a rule with an invalid 'operator' 'sounds-like'/,
+    );
+  });
+
+  it("given_aRuleBasedConditional_whenRoundTripped_thenTheRuleSurvives", () => {
+    const doc = ruleConditionalDocument();
+
+    expect(deserialize(serialize(doc))).toEqual(doc);
+  });
+
+  it("given_aRuleStoredOnAnLlmConditional_whenValidating_thenItIsIgnoredRatherThanRejected", () => {
+    // Toggling a conditional to LLM and back must not cost the user the rule they wrote.
+    const doc = ruleConditionalDocument();
+    const conditional = conditionalOf(doc);
+    conditional.mode = "llm";
+    conditional.question = "Does the report contain a stack trace?";
+
+    expect(validateGraph(doc)).toEqual({ ok: true });
+  });
+
+  it("given_aConditionalWithNoMode_whenReadingItsMode_thenItIsLlmBased", () => {
+    expect(conditionalModeOf({ question: "q", branches: [] })).toBe("llm");
+    expect(conditionalModeOf({ mode: "rule", question: "", branches: [] })).toBe("rule");
+  });
+});
+
+/**
+ * The canonical fan-in graph: the Input splits into two paths that are done in turn and
+ * come back together at one node, which reads both results under their labels.
+ *
+ * ```
+ * Input -> Draft   -\
+ *      \-> Research -+-> Combine -> Output
+ * ```
+ */
+function fanInDocument(): PatchworkDocument {
+  return {
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    workflow: {
+      name: "Brief Topic",
+      description: "Draft a brief and check it against research.",
+    },
+    nodes: [
+      {
+        id: "n1",
+        type: "input",
+        label: "Topic",
+        data: { parameters: [{ name: "topic", description: "The subject." }] },
+      },
+      {
+        id: "n2",
+        type: "prompt",
+        label: "Draft",
+        data: { instruction: "Draft a brief about {topic}." },
+      },
+      {
+        id: "n3",
+        type: "prompt",
+        label: "Research",
+        data: { instruction: "List the facts known about {topic}." },
+      },
+      {
+        id: "n4",
+        type: "prompt",
+        label: "Combine",
+        data: { instruction: "Correct the draft against the facts." },
+      },
+      {
+        id: "n5",
+        type: "output",
+        label: "Brief",
+        data: { description: "The corrected brief." },
+      },
+    ],
+    edges: [
+      { id: "e1", source: "n1", target: "n2" },
+      { id: "e2", source: "n1", target: "n3" },
+      { id: "e3", source: "n2", target: "n4" },
+      { id: "e4", source: "n3", target: "n4" },
+      { id: "e5", source: "n4", target: "n5" },
+    ],
+  };
+}
+
+describe("validateGraph — labeled fan-in", () => {
+  it("given_twoPathsThatSplitAndComeBackTogether_whenValidating_thenReturnsOk", () => {
+    // Fan-in needs a fan-out to exist at all, so an ordinary node may now split into
+    // paths that are all followed — a conditional is where exactly *one* path is taken.
+    expect(validateGraph(fanInDocument())).toEqual({ ok: true });
+  });
+
+  it("given_anEdgeWithAnInputLabel_whenValidating_thenReturnsOk", () => {
+    const doc = fanInDocument();
+    doc.edges[2].inputLabel = "the draft";
+
+    expect(validateGraph(doc)).toEqual({ ok: true });
+  });
+
+  it("given_anInputLabelWithABacktick_whenValidating_thenRejectsWithActionableError", () => {
+    const doc = fanInDocument();
+    doc.edges[2].inputLabel = "the `draft`";
+
+    expect(
+      errorsOf(doc).some((e) =>
+        e.startsWith("Edge e3 carries input label 'the `draft`' with invalid characters"),
+      ),
+    ).toBe(true);
+  });
+
+  it("given_anInputLabelPastTheLengthLimit_whenValidating_thenRejectsWithActionableError", () => {
+    const doc = fanInDocument();
+    doc.edges[2].inputLabel = "a".repeat(MAX_INPUT_LABEL_LENGTH + 1);
+
+    expect(
+      errorsOf(doc).some((e) => e.includes(`at most ${MAX_INPUT_LABEL_LENGTH} characters`)),
+    ).toBe(true);
+  });
+
+  it.each([
+    ["the node labels", (doc: PatchworkDocument) => {
+      doc.nodes[2].label = "Draft";
+    }],
+    ["the edge labels", (doc: PatchworkDocument) => {
+      doc.edges[3].inputLabel = "Draft";
+    }],
+  ])(
+    "given_twoInputsOfOneNodeIndistinguishableBy_%s_whenValidating_thenRejectsWithActionableError",
+    (_case, collide) => {
+      const doc = fanInDocument();
+      collide(doc);
+
+      expect(errorsOf(doc)).toContain(
+        "Node 'n4' has two incoming paths labelled 'Draft'; label the edges or rename the nodes so the step can tell its inputs apart",
+      );
+    },
+  );
+
+  it("given_aConditionalWhoseBranchTailsShareALabel_whenValidating_thenTheConvergenceIsNotAFanIn", () => {
+    // The blocker this test exists for: the two edges arriving at a conditional's
+    // convergence point are the *tails* of two branches, and neither carries a `branch`
+    // field once the branch has a step of its own — which is the ordinary case. Only one
+    // branch ever runs, so only one result ever arrives, so two branch bodies with the
+    // same node label are an ordinary document rather than an ambiguous fan-in.
+    const doc = conditionalDocument();
+    doc.nodes[3].label = "Draft";
+    doc.nodes[4].label = "Draft";
+
+    expect(validateGraph(doc)).toEqual({ ok: true });
+  });
+
+  it("given_aConditionalWhoseBranchesGoStraightToTheJoin_whenValidating_thenTheConvergenceIsNotAFanIn", () => {
+    // The same shape with no intermediate step, where the arriving edges *do* carry a
+    // branch: both spellings of a convergence have to be excluded, not just one.
+    const doc = conditionalDocument();
+    doc.nodes = doc.nodes.filter((n) => n.id !== "n3" && n.id !== "n4");
+    doc.edges = doc.edges.filter((e) => e.id !== "e5" && e.id !== "e6");
+    doc.edges = doc.edges.map((e) =>
+      e.id === "e3" || e.id === "e4" ? { ...e, target: "n5" } : e,
+    );
+
+    expect(validateGraph(doc)).toEqual({ ok: true });
+  });
+
+  it("given_aSplitInsideOneBranchWhosePathsShareALabel_whenValidating_thenItIsStillRefused", () => {
+    // And the discrimination is by *which list a step belongs to*, not by "anything
+    // downstream of a conditional is exempt": two paths that both run inside one branch
+    // are a real fan-in, wherever that branch sits.
+    const doc = conditionalDocument();
+    doc.nodes.push(
+      { id: "s1", type: "prompt", label: "Draft", data: { instruction: "one" } },
+      { id: "s2", type: "prompt", label: "Draft", data: { instruction: "two" } },
+      { id: "s3", type: "prompt", label: "Merge", data: { instruction: "merge" } },
+    );
+    doc.edges = doc.edges.filter((e) => e.id !== "e5");
+    doc.edges.push(
+      { id: "e8", source: "n3", target: "s1" },
+      { id: "e9", source: "n3", target: "s2" },
+      { id: "e10", source: "s1", target: "s3" },
+      { id: "e11", source: "s2", target: "s3" },
+      { id: "e12", source: "s3", target: "n5" },
+    );
+
+    expect(errorsOf(doc)).toContain(
+      "Node 's3' has two incoming paths labelled 'Draft'; label the edges or rename the nodes so the step can tell its inputs apart",
+    );
+  });
+
+  it("given_aNodeSplittingIntoMorePathsThanTheLimit_whenValidating_thenRejectsWithActionableError", () => {
+    const doc = fanInDocument();
+    for (let at = 0; at < MAX_FAN_OUT; at += 1) {
+      doc.nodes.push({
+        id: `p${at}`,
+        type: "prompt",
+        label: `Path ${at}`,
+        data: { instruction: "x" },
+      });
+      doc.edges.push({ id: `ea${at}`, source: "n1", target: `p${at}` });
+      doc.edges.push({ id: `eb${at}`, source: `p${at}`, target: "n4" });
+    }
+
+    expect(errorsOf(doc)).toContain(
+      `Node 'n1' splits into ${MAX_FAN_OUT + 2} paths; at most ${MAX_FAN_OUT} can be written as a list a reader could follow. Merge some of them before splitting again.`,
+    );
+  });
+
+  it("given_anEdgeInputLabelThatIsNotAString_whenDeserializing_thenThrowsActionableError", () => {
+    const doc = fanInDocument();
+    (doc.edges[2] as { inputLabel: unknown }).inputLabel = 7;
+
+    expect(() => deserialize(JSON.stringify(doc))).toThrow(
+      /edge at index 2 'inputLabel' must be a string when present/,
+    );
+  });
+
+  it("given_anEdgeWithNoInputLabel_whenAskingWhatItCarries_thenTheSourceNodesLabelNamesIt", () => {
+    const doc = fanInDocument();
+
+    expect(inputLabelOf(doc.edges[2], doc.nodes[1])).toBe("Draft");
+    expect(inputLabelOf({ ...doc.edges[2], inputLabel: "the draft" }, doc.nodes[1])).toBe(
+      "the draft",
+    );
+    expect(inputLabelOf(doc.edges[2], { ...doc.nodes[1], label: "  " })).toBe("n2");
+  });
+
+  it.each([
+    ["blank", "   "],
+    ["a tab", "\t"],
+    ["a newline", "\n"],
+  ])(
+    "given_anEdgeLabelledWith_%s_whenAskingWhatItCarries_thenItFallsBackToTheSourceNode",
+    (_case, blank) => {
+      // Whitespace is not a name. Without the trim the compiler would emit ``Inputs — `  ` ``
+      // — a label the reading model is asked to quote back and cannot see — instead of the
+      // node label that is right there on the canvas.
+      const doc = fanInDocument();
+      doc.edges[2].inputLabel = blank;
+
+      expect(inputLabelOf(doc.edges[2], doc.nodes[1])).toBe("Draft");
+      expect(validateGraph(doc)).toEqual({ ok: true });
+    },
+  );
+});
+
+describe("deserialize — forward migration to v5", () => {
+  it("given_schemaV4Fixture_whenDeserializing_thenItOpensUnchangedAtTheCurrentVersion", () => {
+    // v4 -> v5 only widened the vocabulary (a conditional mode, a rule, an optional edge
+    // field), so a document from before rule-based conditionals opens exactly as it was.
+    const original = JSON.parse(readFixture("schema-v4.patchwork")) as PatchworkDocument;
+
+    const migrated = deserialize(readFixture("schema-v4.patchwork"));
+
+    expect(migrated.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+    expect(migrated.workflow).toEqual(original.workflow);
+    expect(migrated.nodes).toEqual(original.nodes);
+    expect(migrated.edges).toEqual(original.edges);
+    expect(validateGraph(migrated)).toEqual({ ok: true });
+  });
+
+  it("given_schemaV4Fixture_whenDeserializing_thenItsConditionalIsStillLlmBased", () => {
+    const migrated = deserialize(readFixture("schema-v4.patchwork"));
+    const conditional = migrated.nodes.find((n) => n.type === "conditional");
+
+    expect(conditionalModeOf(conditional?.data as ConditionalData)).toBe("llm");
   });
 });

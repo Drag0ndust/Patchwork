@@ -1,18 +1,29 @@
 import {
   artifactKindOf,
   branchesWithinLimit,
+  conditionalModeOf,
+  DEFAULT_RULE_OPERATOR,
+  comparedOperand,
   exportModeOf,
+  isComparableNumber,
+  isWholeNumber,
   MAX_BRANCHES_PER_CONDITIONAL,
+  MAX_RULE_NUMBER_DIGITS,
   MIN_BRANCHES_PER_CONDITIONAL,
+  NUMERIC_RULE_OPERATORS,
   type ArtifactRefData,
   type Branch,
   type ConditionalData,
+  type ConditionalMode,
+  type ConditionalRule,
   type ExportMode,
   type InputData,
   type NodeData,
   type NodeType,
   type OutputData,
   type PromptData,
+  type RuleOperator,
+  withOperator,
 } from "../domain/graph-document";
 import { newId } from "../domain/ids";
 import type { ArtifactKind } from "../domain/artifact-codec";
@@ -224,8 +235,175 @@ function ArtifactPicker({
 }
 
 /**
- * Edit an LLM conditional: the question the executing model has to answer, and the
- * branches it chooses between.
+ * How each comparison is offered to the user.
+ *
+ * A phrase rather than the symbol the canvas node shows: a select is read as a sentence
+ * about the value above it ("the value I measure *is greater than* 100"), while a node
+ * has room for one line and reads better as an expression.
+ */
+const OPERATOR_LABELS: Record<RuleOperator, string> = {
+  equals: "is",
+  "not-equals": "is not",
+  contains: "contains",
+  "greater-than": "is greater than",
+  "less-than": "is less than",
+};
+
+/** The rule a conditional starts from when it is switched to rule-based. */
+function freshRule(branches: readonly Branch[]): ConditionalRule {
+  return {
+    subject: "",
+    operator: DEFAULT_RULE_OPERATOR,
+    operand: "",
+    // Wired to the branches the node already offers, so a new rule routes somewhere
+    // instead of naming branches that do not exist.
+    whenTrue: branches[0]?.id ?? "",
+    whenFalse: branches[1]?.id ?? "",
+  };
+}
+
+/**
+ * Edit the deterministic check a rule-based conditional routes by.
+ *
+ * The split of labour is what the fields are shaped around, and it is the whole point of
+ * the mode (ADR-0004): the **subject** is prose, because the executing model is the only
+ * party that can read the work so far and measure it, while everything else is data a
+ * shell script compares — so the subject gets a textarea and the rest get controls with
+ * a fixed vocabulary.
+ *
+ * Every edit is an **update** over the node's current data, like every other control in
+ * this dock: five fields over one object, and rebuilding it from the rendered props
+ * would let two edits landing in the same tick overwrite each other.
+ */
+function RuleFields({
+  rule,
+  branches,
+  onChange,
+}: {
+  rule: ConditionalRule;
+  branches: readonly Branch[];
+  onChange: (edit: (current: ConditionalRule) => ConditionalRule) => void;
+}) {
+  const numeric = NUMERIC_RULE_OPERATORS.includes(rule.operator);
+  // Said here, not only at export: the operand is typed by hand, and "the export was
+  // refused" is a worse place to learn that a numeric comparison needs a number — or that
+  // the number it was given is one no two shells compare alike.
+  // `comparedOperand`, so the dock's verdict is the export's verdict rather than a third
+  // spelling of the same normalization — which is what let a padded number pass validation
+  // and then refuse to route (see its comment in the schema).
+  const written = comparedOperand(rule);
+  const operandProblem =
+    !numeric || written.trim() === ""
+      ? undefined
+      : !isWholeNumber(written)
+        ? `'${rule.operand}' is not a whole number, and this comparison needs one — the export is refused until it is.`
+        : !isComparableNumber(written)
+          ? `'${rule.operand}' has more than ${MAX_RULE_NUMBER_DIGITS} digits, and a rule is compared by a shell — only numbers up to ${"9".repeat(MAX_RULE_NUMBER_DIGITS)} compare the same way everywhere. The export is refused until it does.`
+          : undefined;
+  // Not a problem — ` x ` is a legitimate thing to look for — but the one surface that can
+  // say so before the export does. Every other rendering of this value collapses its
+  // whitespace, so without this the author has nowhere to see that ` 5` and `5` are two
+  // different comparisons.
+  const operandNote =
+    numeric || written.trim() === "" || written === written.trim()
+      ? undefined
+      : `This compares against "${written}" exactly, spaces included. Trim it if you did not mean them.`;
+
+  return (
+    <>
+      <label className="pw-field pw-field--grow">
+        <span>Value to measure</span>
+        <textarea
+          value={rule.subject}
+          onChange={(e) => {
+            // Read out of the event before the updater, as everywhere else here: the
+            // control is controlled, so by then the DOM value is back to the prop.
+            const subject = e.target.value;
+            onChange((current) => ({ ...current, subject }));
+          }}
+          placeholder="e.g. the number of files the diff touches"
+        />
+      </label>
+      <label className="pw-field">
+        <span>Comparison</span>
+        <select
+          value={rule.operator}
+          onChange={(e) => {
+            const operator = e.target.value as RuleOperator;
+            // `withOperator`, not a field assignment: changing the comparison changes what
+            // the *operand* means, and padding a numeric comparison was ignoring must not
+            // become data a string comparison matches on. The rule is the schema's, so the
+            // dock, the validator and the compiler cannot drift apart about it.
+            onChange((current) => withOperator(current, operator));
+          }}
+        >
+          {(Object.keys(OPERATOR_LABELS) as RuleOperator[]).map((operator) => (
+            <option key={operator} value={operator}>
+              {OPERATOR_LABELS[operator]}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="pw-field">
+        <span>Compared against</span>
+        <input
+          value={rule.operand}
+          onChange={(e) => {
+            const operand = e.target.value;
+            onChange((current) => ({ ...current, operand }));
+          }}
+          placeholder={numeric ? "e.g. 10" : "e.g. crash"}
+        />
+      </label>
+      {operandProblem !== undefined && (
+        <p className="pw-ref pw-ref--unresolved" role="status">
+          {operandProblem}
+        </p>
+      )}
+      {operandNote !== undefined && (
+        <p className="pw-ref" role="status">
+          {operandNote}
+        </p>
+      )}
+      {(
+        [
+          ["When it holds, take branch", "whenTrue"],
+          ["When it does not, take branch", "whenFalse"],
+        ] as const
+      ).map(([label, field]) => (
+        <label className="pw-field" key={field}>
+          <span>{label}</span>
+          <select
+            value={rule[field]}
+            onChange={(e) => {
+              // The branch **id**, never its label or position: renaming or reordering a
+              // branch is an ordinary edit and must not invert the routing (ADR-0003).
+              const picked = e.target.value;
+              onChange((current) => ({ ...current, [field]: picked }));
+            }}
+          >
+            {rule[field] !== "" && !branches.some((branch) => branch.id === rule[field]) && (
+              <option value={rule[field]}>{rule[field]} (no such branch)</option>
+            )}
+            {branches.map((branch) => (
+              <option key={branch.id} value={branch.id}>
+                {branch.label.trim() || branch.id}
+              </option>
+            ))}
+          </select>
+        </label>
+      ))}
+      <p className="pw-ref">
+        Claude Code measures the value above and the control scaffold exported with this
+        workflow compares it, so the same measured value always takes the same branch.
+      </p>
+    </>
+  );
+}
+
+/**
+ * Edit a conditional: what decides it, the decision that mode needs, and the branches it
+ * chooses between.
  *
  * Every edit is sent as an **update** over the node's current data, for the reason the
  * artifact picker is: the question and the branch list are separate controls over one
@@ -243,7 +421,15 @@ function ConditionalFields({
   data: ConditionalData;
   onChange: (edit: (current: ConditionalData) => ConditionalData) => void;
 }) {
-  const branches = Array.isArray(data.branches) ? data.branches : [];
+  // Normalized for *rendering* only, and tolerant of an entry that is not a branch — the
+  // shape `workflow-order` already guards against, because a hand-edited file can hold
+  // anything in that array. `deserialize` rejects such a file, so this is unreachable
+  // through the app; the asymmetry is the point, since a dock that throws takes the whole
+  // session to the error boundary while every other surface degrades. What is *written*
+  // still goes through `editBranches`, over the data as it actually is.
+  const branches: Branch[] = (Array.isArray(data.branches) ? data.branches : []).map(
+    (branch) => ({ id: branch?.id ?? "", label: branch?.label ?? "" }),
+  );
   /** Rewrite the branch list, leaving every other field of the data as it is. */
   const editBranches = (rewrite: (current: Branch[]) => Branch[]) =>
     onChange((current) => ({
@@ -256,11 +442,32 @@ function ConditionalFields({
   // field's own label, and the *reason* appears only at a bound — in a `role="status"`
   // region, so it is announced when the limit is reached instead of being discovered as a
   // dead button, and so nothing is announced while there is nothing to say.
-  const atCeiling = branches.length >= MAX_BRANCHES_PER_CONDITIONAL;
+  //
+  // A rule-based conditional has a third, tighter bound: a rule holds or it does not, so
+  // it decides between exactly two branches and both controls are at their limit at once.
+  // It is stated the same way rather than silently disabling the buttons.
+  const mode = conditionalModeOf(data);
+  const exactlyTwo = mode === "rule";
+  // A bound is only half the job: the dock also has to leave the way out open. A rule-based
+  // conditional switched on with three branches is *over* its bound, and the way back is
+  // downwards — so this tightens the **ceiling** to two and leaves the floor where it is.
+  // Disabling both at once (which is what `atFloor = exactlyTwo || …` did) locked the extra
+  // branches in place and left switching back to LLM, trimming, and switching again as the
+  // only route: the dock refusing to repair what it had just made invalid.
+  const twoReason =
+    branches.length > MIN_BRANCHES_PER_CONDITIONAL
+      ? `A rule holds or it does not, so a rule-based conditional decides between exactly two branches (this one has ${branches.length} — remove one).`
+      : "A rule holds or it does not, so a rule-based conditional decides between exactly two branches.";
+  const atCeiling =
+    branches.length >=
+    (exactlyTwo ? MIN_BRANCHES_PER_CONDITIONAL : MAX_BRANCHES_PER_CONDITIONAL);
   const atFloor = branches.length <= MIN_BRANCHES_PER_CONDITIONAL;
-  const ceilingReason = `At the limit of ${MAX_BRANCHES_PER_CONDITIONAL} branches. Remove one, or branch again inside a branch.`;
-  const floorReason =
-    "A conditional offers a choice, so it keeps at least two branches.";
+  const ceilingReason = exactlyTwo
+    ? twoReason
+    : `At the limit of ${MAX_BRANCHES_PER_CONDITIONAL} branches. Remove one, or branch again inside a branch.`;
+  const floorReason = exactlyTwo
+    ? twoReason
+    : "A conditional offers a choice, so it keeps at least two branches.";
 
   // A document can be *opened* over the limit — `deserialize` keeps every branch and
   // `validateGraph` refuses the export (ADR-0003) — so the dock has the same job the canvas
@@ -273,27 +480,73 @@ function ConditionalFields({
 
   return (
     <>
-      <label className="pw-field pw-field--grow">
-        <span>Decision question</span>
-        <textarea
-          value={data.question}
+      <label className="pw-field">
+        <span>Decided by</span>
+        <select
+          value={mode}
           onChange={(e) => {
-            // Read out of the event *before* the updater, which runs later: the
-            // control is controlled, so by then the DOM value has been set back to
-            // the prop and the edit would read as a no-op.
-            const question = e.target.value;
-            onChange((current) => ({ ...current, question }));
+            const picked = e.target.value as ConditionalMode;
+            onChange((current) => ({
+              ...current,
+              mode: picked,
+              // A rule is minted only when there is none. Neither field is ever cleared
+              // by switching: looking at the other mode must not cost the user what they
+              // wrote, and the compiler reads only the field the mode selects.
+              ...(picked === "rule" && current.rule === undefined
+                ? {
+                    rule: freshRule(
+                      Array.isArray(current.branches) ? current.branches : [],
+                    ),
+                  }
+                : {}),
+            }));
           }}
-          placeholder="e.g. Does the report contain a stack trace?"
-        />
+        >
+          {/* Each option states its consequence, like the export-mode select: the choice
+              is about *who* decides this branch when the exported workflow runs. */}
+          <option value="llm">Claude Code, from a question — best effort</option>
+          <option value="rule">A rule in the control scaffold — deterministic</option>
+        </select>
       </label>
+      {mode === "llm" ? (
+        <label className="pw-field pw-field--grow">
+          <span>Decision question</span>
+          <textarea
+            value={data.question}
+            onChange={(e) => {
+              // Read out of the event *before* the updater, which runs later: the
+              // control is controlled, so by then the DOM value has been set back to
+              // the prop and the edit would read as a no-op.
+              const question = e.target.value;
+              onChange((current) => ({ ...current, question }));
+            }}
+            placeholder="e.g. Does the report contain a stack trace?"
+          />
+        </label>
+      ) : (
+        <RuleFields
+          rule={data.rule ?? freshRule(branches)}
+          branches={branches}
+          onChange={(edit) =>
+            onChange((current) => ({
+              ...current,
+              rule: edit(
+                current.rule ??
+                  freshRule(Array.isArray(current.branches) ? current.branches : []),
+              ),
+            }))
+          }
+        />
+      )}
       <div className="pw-field pw-field--grow">
         <span>
           Branches ({branches.length} of {MAX_BRANCHES_PER_CONDITIONAL})
         </span>
         <ul className="pw-branches">
           {shown.map((branch, index) => (
-            <li key={branch.id} className="pw-branches__item">
+            // Keyed by id, falling back to the position for an entry that has none, so two
+            // malformed entries cannot collide on one key.
+            <li key={branch.id || `at-${index}`} className="pw-branches__item">
               <input
                 // Numbered, not named by the label: the label is what is being
                 // edited, so it cannot also be the handle used to find the field.
@@ -302,8 +555,11 @@ function ConditionalFields({
                 onChange={(e) => {
                   // Captured eagerly, as with the question above.
                   const label = e.target.value;
+                  // `b?.id`, matching the tolerance the rendered list has: the write side
+                  // of a guard is where it has to hold, or editing the *good* branch beside
+                  // a malformed entry throws — on the control the user can actually reach.
                   editBranches((current) =>
-                    current.map((b) => (b.id === branch.id ? { ...b, label } : b)),
+                    current.map((b) => (b?.id === branch.id ? { ...b, label } : b)),
                   );
                 }}
                 placeholder="e.g. with trace"
@@ -314,7 +570,7 @@ function ConditionalFields({
                 title={atFloor ? floorReason : undefined}
                 disabled={atFloor}
                 onClick={() =>
-                  editBranches((current) => current.filter((b) => b.id !== branch.id))
+                  editBranches((current) => current.filter((b) => b?.id !== branch.id))
                 }
               >
                 ✕
@@ -355,8 +611,9 @@ function ConditionalFields({
           </p>
         )}
         <p className="pw-ref">
-          Claude Code answers the question above at run time and follows the one branch
-          it picks. Wire each branch from its own handle on the node.
+          {mode === "llm"
+            ? "Claude Code answers the question above at run time and follows the one branch it picks. Wire each branch from its own handle on the node."
+            : "The exported scaffold prints one of these labels and Claude Code follows that branch. Wire each branch from its own handle on the node."}
         </p>
       </div>
     </>

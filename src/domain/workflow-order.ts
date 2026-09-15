@@ -10,6 +10,12 @@
  * itself a segment holding sub-lists — so a consumer never has to re-derive where a
  * branch ends.
  *
+ * Slice 7 adds the other fan-out: a **plain split**, where every path is followed rather
+ * than one of them. It needs no segment kind — the paths are appended to the list the
+ * splitting node sits in, in the order they were drawn, and the walk resumes where they
+ * converge — but it shares the conditional's scoping, which is what stops a path *before*
+ * the convergence point so the merge is instructed once (see [`pushWalks`]).
+ *
  * Two consumers, deliberately the same traversal:
  *
  * - the **Graph Compiler**, which renders the segments as the umbrella's numbered
@@ -19,10 +25,10 @@
  *   disagreeing notion of a well-formed branch.
  *
  * This module imports the schema for **types only**, so the mutual import with
- * `graph-document` (which calls `planWorkflow`) is not a runtime cycle: neither
- * module touches the other's bindings while either is still evaluating. The one
- * exception is [`branchesOf`], a tolerant accessor that belongs with the schema it
- * reads and is called only from inside functions here.
+ * `graph-document` (which calls `planWorkflow` and [`fanInInputs`]) is not a runtime
+ * cycle: neither module touches the other's bindings while either is still evaluating.
+ * The two exceptions are [`branchesOf`] and `inputLabelOf` — tolerant accessors that
+ * belong with the schema they read, and are called only from inside functions here.
  *
  * Nothing here throws, for any document, however malformed. A cycle, a dangling branch,
  * a node with two ways out, an unreachable node: each is `validateGraph`'s to reject, and
@@ -41,7 +47,7 @@
  * "any document compiles".
  */
 
-import { branchesOf } from "./graph-document";
+import { branchesOf, inputLabelOf } from "./graph-document";
 import type {
   Branch,
   GraphEdge,
@@ -115,6 +121,47 @@ type WalkJob =
   | { kind: "enter"; id: string }
   | { kind: "leave"; id: string };
 
+/** One path out of a fan-out: where it starts, and the list its steps belong to. */
+interface WalkBody {
+  collect: FlowSegment[];
+  start: string;
+}
+
+/**
+ * Queue the paths a node fans out into, and the walk that continues past them.
+ *
+ * One helper for both fan-outs, because the *scoping* is the whole of what makes a
+ * fan-out followable and it is identical for the two: the join's scope opens, every
+ * path is walked inside it — so each stops before the convergence point instead of
+ * instructing it — the scope closes, and only then does the enclosing walk resume
+ * there. The two differ solely in where each path's steps are collected: a
+ * conditional's into its own branch's list (only one of them runs), a plain split's
+ * into the list it sits in (all of them run).
+ *
+ * Queued in reading order and processed in it. An undefined `join` means the paths
+ * never converge — a graph `validateGraph` refuses — in which case each path simply
+ * runs to its end and the enclosing walk stops.
+ */
+function pushWalks(
+  jobs: WalkJob[],
+  bodies: readonly WalkBody[],
+  join: string | undefined,
+  after: FlowSegment[],
+): void {
+  const queued: WalkJob[] = [];
+  if (join !== undefined) queued.push({ kind: "enter", id: join });
+  for (const body of bodies) {
+    queued.push({ kind: "walk", collect: body.collect, start: body.start });
+  }
+  if (join !== undefined) {
+    queued.push({ kind: "leave", id: join });
+    queued.push({ kind: "walk", collect: after, start: join });
+  }
+  // Reversed rather than spread, like every other push here: a conditional may carry
+  // thousands of branches, and `push(...queued)` passes each as an argument.
+  for (let at = queued.length - 1; at >= 0; at -= 1) jobs.push(queued[at]);
+}
+
 /** Plan the order a document runs in. Pure; never throws. */
 export function planWorkflow(
   doc: PatchworkDocument,
@@ -182,10 +229,30 @@ export function planWorkflow(
       const edges: GraphEdge[] = outgoing.get(cursor) ?? [];
       if (node.type !== "conditional") {
         job.collect.push({ kind: "step", node });
-        // More than one way out of a non-conditional node is a validation error;
-        // taking the first keeps the plan total instead of guessing at a merge.
-        cursor = edges[0]?.target;
-        continue;
+        // Deduplicated: two edges to one node are one path, and instructing it twice
+        // is precisely what the "reached more than once" problem exists to prevent.
+        const paths = [...new Set(edges.map((edge) => edge.target))];
+        if (paths.length <= 1) {
+          cursor = paths[0];
+          continue;
+        }
+        // A **plain split**: every path is followed, unlike a conditional's branches,
+        // where exactly one is. So it needs no segment of its own — the paths are
+        // appended to this same list, in the order the user drew them, and the walk
+        // resumes at the node they converge on. What tells a reader the paths are
+        // related is the convergence point itself, which reads its inputs under their
+        // labels (see the Graph Compiler's fan-in prose).
+        //
+        // The scoping is the conditional's, for the same reason: a path must stop
+        // *before* the convergence point, or the merge would be instructed once per
+        // path.
+        pushWalks(
+          jobs,
+          paths.map((start) => ({ collect: job.collect, start })),
+          convergence(paths, indexOf()),
+          job.collect,
+        );
+        break;
       }
 
       // The node each branch leaves by. First edge wins for a branch wired twice
@@ -203,12 +270,7 @@ export function planWorkflow(
       }));
       job.collect.push({ kind: "branch", node, branches: planned });
 
-      // Queued in reading order and processed in it: the join's scope opens, every branch
-      // body is walked inside it, the scope closes, and only then does this walk continue
-      // at the join. Undefined means the branches never converge (a graph validation
-      // rejects), in which case each body simply runs to its end and this walk stops.
-      const queued: WalkJob[] = [];
-      if (join !== undefined) queued.push({ kind: "enter", id: join });
+      const bodies: WalkBody[] = [];
       for (const entry of planned) {
         // `entry.branch?.id`, because a hand-built document can hold anything in that array and
         // this module's promise is that nothing here throws for any document. A branch that is
@@ -218,13 +280,9 @@ export function planWorkflow(
         // An unwired branch contributes no steps rather than no branch: the umbrella
         // still shows the choice the user drew, and validation refuses the export.
         if (head === undefined) continue;
-        queued.push({ kind: "walk", collect: entry.segments, start: head });
+        bodies.push({ collect: entry.segments, start: head });
       }
-      if (join !== undefined) {
-        queued.push({ kind: "leave", id: join });
-        queued.push({ kind: "walk", collect: job.collect, start: join });
-      }
-      for (let at = queued.length - 1; at >= 0; at -= 1) jobs.push(queued[at]);
+      pushWalks(jobs, bodies, join, job.collect);
       break;
     }
   }
@@ -289,6 +347,117 @@ export function plannedNodes(plan: WorkflowPlan): GraphNode[] {
  */
 function pushReversed(stack: FlowSegment[], segments: readonly FlowSegment[]): void {
   for (let at = segments.length - 1; at >= 0; at -= 1) stack.push(segments[at]);
+}
+
+/** Where the plan puts a node: how far in it is read, and which list it belongs to. */
+export interface Placement {
+  /** Position in reading order, which is [`plannedNodes`]' order. */
+  at: number;
+  /** The segment list it sits in — the main sequence, or one branch of one branch point. */
+  list: number;
+}
+
+/**
+ * Place every node the plan holds, in one pre-order walk.
+ *
+ * Both halves answer a question about *edges* that the nodes alone cannot: which of them
+ * carry a result into a step that reads several at once (see [`fanInInputs`]). The list
+ * identity is why this is a walk of the plan rather than a scan of the document — "these
+ * two results arrive together" is a fact about the traversal, not about the graph.
+ *
+ * Iterative, like every other traversal here: nesting is whatever the user drew.
+ */
+export function placements(plan: WorkflowPlan): Map<string, Placement> {
+  const placed = new Map<string, Placement>();
+  const stack: Array<{ segment: FlowSegment; list: number }> = [];
+  const push = (segments: readonly FlowSegment[], list: number) => {
+    for (let index = segments.length - 1; index >= 0; index -= 1) {
+      stack.push({ segment: segments[index], list });
+    }
+  };
+  push(plan.segments, 0);
+
+  let at = 0;
+  let lists = 0;
+  while (stack.length > 0) {
+    const { segment, list } = stack.pop() as { segment: FlowSegment; list: number };
+    // First placement wins, so a document with duplicate node ids (which `validateGraph`
+    // refuses) reads as the first of them rather than throwing.
+    if (!placed.has(segment.node.id)) placed.set(segment.node.id, { at, list });
+    at += 1;
+    if (segment.kind !== "branch") continue;
+    for (let branch = segment.branches.length - 1; branch >= 0; branch -= 1) {
+      lists += 1;
+      push(segment.branches[branch].segments, lists);
+    }
+  }
+  return placed;
+}
+
+/** One result arriving at a step: the edge that carries it, and what it is called. */
+export interface FanInInput {
+  edge: GraphEdge;
+  label: string;
+}
+
+/**
+ * What arrives at each node that more than one path leads into, under the labels the
+ * results arrive with — keyed by node id, in the order the edges were drawn.
+ *
+ * **One rule, asked in two places.** The Graph Compiler renders these labels into the
+ * step that reads them, and `validateGraph` refuses a pair of them a reader could not
+ * tell apart; a second, independently derived notion of "these arrive together" would
+ * drift into refusing documents the compiler emits perfectly well — which is exactly what
+ * happened when validation worked from the raw edges. It lives here because every part of
+ * the answer is a fact about the *plan*.
+ *
+ * Four edges are deliberately not inputs:
+ *
+ * - a **branch** edge, because a conditional's branches are alternatives rather than
+ *   inputs: exactly one of them arrives, so there is nothing to concatenate;
+ * - an edge that leaves a **branch body**, which is the same exclusion one step further
+ *   on. The edges arriving at a conditional's convergence point are the tails of its
+ *   branches, and once a branch has a step of its own — the ordinary case — none of them
+ *   carries a `branch` field any more. Only their **list** still says they are
+ *   alternatives, and a fan-in is two paths that are *both* followed, which is exactly
+ *   the pair the plan collects into one list;
+ * - an edge whose endpoint the plan never placed, which is a document `validateGraph`
+ *   refuses; and
+ * - a **loop-back**, an edge arriving from a step that comes *later* in the plan. That is
+ *   the distinction this exists to make: a fan-in **concatenates** its inputs under
+ *   labels, while a loop-back carries the next pass's value and **replaces** what the step
+ *   worked on last time. Counting incoming edges cannot tell them apart — direction can.
+ *   (Loops are a later slice and a cycle is refused meanwhile; what is settled here is
+ *   that when they land, a back edge does not silently become a second labelled input.)
+ *
+ * A node with a single input is absent: one result needs no name, and nothing about it
+ * can be ambiguous.
+ */
+export function fanInInputs(
+  doc: PatchworkDocument,
+  plan: WorkflowPlan,
+): Map<string, FanInInput[]> {
+  const placed = placements(plan);
+  const byId = new Map(doc.nodes.map((node) => [node.id, node]));
+
+  const arriving = new Map<string, FanInInput[]>();
+  for (const edge of doc.edges) {
+    if (edge.branch !== undefined && edge.branch !== "") continue;
+    const from = placed.get(edge.source);
+    const to = placed.get(edge.target);
+    if (from === undefined || to === undefined) continue;
+    if (from.at >= to.at) continue;
+    if (from.list !== to.list) continue;
+    const inputs = arriving.get(edge.target) ?? [];
+    inputs.push({ edge, label: inputLabelOf(edge, byId.get(edge.source)) });
+    arriving.set(edge.target, inputs);
+  }
+
+  const fanIn = new Map<string, FanInInput[]>();
+  for (const [id, inputs] of arriving) {
+    if (inputs.length > 1) fanIn.set(id, inputs);
+  }
+  return fanIn;
 }
 
 /**

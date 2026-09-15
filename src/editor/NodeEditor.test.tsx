@@ -4,7 +4,10 @@ import { describe, expect, it, vi } from "vitest";
 import type { PatchNode } from "../canvas/react-flow-adapter";
 import {
   branchesWithinLimit,
+  DEFAULT_RULE_OPERATOR,
   MAX_BRANCHES_PER_CONDITIONAL,
+  type ConditionalData,
+  type ConditionalRule,
   type ExportMode,
   type NodeData,
 } from "../domain/graph-document";
@@ -576,5 +579,344 @@ describe("NodeEditor — a conditional that was opened over the limit", () => {
     );
 
     expect(screen.queryByRole("button", { name: /branches past the limit/ })).toBeNull();
+  });
+});
+
+/** The same conditional, decided by a rule the exported scaffold evaluates. */
+function ruleConditionalNode(rule?: Partial<ConditionalRule>): PatchNode {
+  const node = conditionalNode();
+  node.data.node = {
+    mode: "rule",
+    question: "",
+    rule: {
+      subject: "the number of stack frames in the report",
+      operator: "greater-than",
+      operand: "0",
+      whenTrue: "b1",
+      whenFalse: "b2",
+      ...rule,
+    },
+    branches: [
+      { id: "b1", label: "with trace" },
+      { id: "b2", label: "no trace" },
+    ],
+  };
+  return node;
+}
+
+describe("NodeEditor — choosing what decides a Conditional", () => {
+  it("given_anLlmConditional_whenRendered_thenTheQuestionIsEditedAndNoRuleIs", () => {
+    render(<NodeEditor node={conditionalNode()} catalog={catalog()} onChange={vi.fn()} />);
+
+    expect((screen.getByLabelText("Decided by") as HTMLSelectElement).value).toBe("llm");
+    expect(screen.getByLabelText("Decision question")).toBeTruthy();
+    expect(screen.queryByLabelText("Value to measure")).toBeNull();
+  });
+
+  it("given_anLlmConditional_whenSwitchedToRuleBased_thenItGetsARuleToFillInAndKeepsTheQuestion", () => {
+    // The question is kept rather than cleared: switching modes to look at the other one
+    // must not cost the user what they wrote (the compiler reads only the mode's own field).
+    const onChange = vi.fn();
+    render(<NodeEditor node={conditionalNode()} catalog={catalog()} onChange={onChange} />);
+
+    fireEvent.change(screen.getByLabelText("Decided by"), { target: { value: "rule" } });
+
+    expect(applied(onChange.mock.calls[0][2], conditionalNode().data.node)).toEqual({
+      mode: "rule",
+      question: "Does the report contain a stack trace?",
+      rule: {
+        subject: "",
+        operator: DEFAULT_RULE_OPERATOR,
+        operand: "",
+        // Routed to the branches the node already offers, so a fresh rule is wired
+        // rather than pointing at nothing.
+        whenTrue: "b1",
+        whenFalse: "b2",
+      },
+      branches: [
+        { id: "b1", label: "with trace" },
+        { id: "b2", label: "no trace" },
+      ],
+    });
+  });
+
+  it("given_aRuleBasedConditional_whenSwitchedBackAndForth_thenTheRuleIsKept", () => {
+    const onChange = vi.fn();
+    render(<NodeEditor node={ruleConditionalNode()} catalog={catalog()} onChange={onChange} />);
+
+    fireEvent.change(screen.getByLabelText("Decided by"), { target: { value: "llm" } });
+
+    expect(applied(onChange.mock.calls[0][2], ruleConditionalNode().data.node)).toEqual({
+      ...ruleConditionalNode().data.node,
+      mode: "llm",
+    });
+  });
+
+  it("given_aRuleBasedConditional_whenRendered_thenEveryPartOfTheCheckIsEditable", () => {
+    render(<NodeEditor node={ruleConditionalNode()} catalog={catalog()} onChange={vi.fn()} />);
+
+    expect((screen.getByLabelText("Value to measure") as HTMLTextAreaElement).value).toBe(
+      "the number of stack frames in the report",
+    );
+    expect((screen.getByLabelText("Comparison") as HTMLSelectElement).value).toBe(
+      "greater-than",
+    );
+    expect((screen.getByLabelText("Compared against") as HTMLInputElement).value).toBe("0");
+    expect((screen.getByLabelText("When it holds, take branch") as HTMLSelectElement).value).toBe(
+      "b1",
+    );
+    expect(
+      (screen.getByLabelText("When it does not, take branch") as HTMLSelectElement).value,
+    ).toBe("b2");
+    expect(screen.queryByLabelText("Decision question")).toBeNull();
+  });
+
+  it.each([
+    ["Value to measure", "subject", "the number of files touched"],
+    ["Compared against", "operand", "10"],
+  ])(
+    "given_aRuleBasedConditional_whenEditing_%s_thenOnlyThatPartOfTheRuleChanges",
+    (field, key, value) => {
+      const onChange = vi.fn();
+      render(<NodeEditor node={ruleConditionalNode()} catalog={catalog()} onChange={onChange} />);
+
+      fireEvent.change(screen.getByLabelText(field), { target: { value } });
+
+      const before = ruleConditionalNode().data.node as ConditionalData;
+      expect(applied(onChange.mock.calls[0][2], before)).toEqual({
+        ...before,
+        rule: { ...(before.rule as ConditionalRule), [key]: value },
+      });
+    },
+  );
+
+  it("given_aRuleBasedConditional_whenTheRoutingIsChanged_thenTheBranchIdIsWhatIsStored", () => {
+    // Ids, not positions or labels: renaming or reordering a branch is an ordinary edit
+    // and must not silently invert the routing (ADR-0003).
+    const onChange = vi.fn();
+    render(<NodeEditor node={ruleConditionalNode()} catalog={catalog()} onChange={onChange} />);
+
+    fireEvent.change(screen.getByLabelText("When it holds, take branch"), {
+      target: { value: "b2" },
+    });
+
+    const before = ruleConditionalNode().data.node as ConditionalData;
+    expect(applied(onChange.mock.calls[0][2], before)).toEqual({
+      ...before,
+      rule: { ...(before.rule as ConditionalRule), whenTrue: "b2" },
+    });
+  });
+
+  it("given_aNumericComparisonAgainstSomethingThatIsNotANumber_whenRendered_thenTheDockSaysSoBeforeTheExportDoes", () => {
+    render(
+      <NodeEditor
+        node={ruleConditionalNode({ operand: "a few" })}
+        catalog={catalog()}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        "'a few' is not a whole number, and this comparison needs one — the export is refused until it is.",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("given_aRuleBasedConditional_whenLookingAtTheBranchControls_thenBothAreOfferedWithTheirReason", () => {
+    // A rule holds or it does not, so this node decides between exactly two branches —
+    // stated, the way both branch bounds are, rather than only enforced at export.
+    render(<NodeEditor node={ruleConditionalNode()} catalog={catalog()} onChange={vi.fn()} />);
+
+    expect((screen.getByLabelText("Add branch") as HTMLButtonElement).disabled).toBe(true);
+    expect(
+      screen.getByText(
+        "A rule holds or it does not, so a rule-based conditional decides between exactly two branches.",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("given_aRuleBasedConditionalWithMoreThanTwoBranches_whenRendered_thenTheExtrasCanStillBeRemoved", () => {
+    // The dock's job is to offer the way out of a bound, not only to state it. Switching a
+    // three-branch conditional to rule-based puts it *over* the two-branch rule, and
+    // disabling every remove button left no way back except switching to LLM, trimming, and
+    // switching again — the dock refusing to fix what it had just made invalid.
+    const node = ruleConditionalNode();
+    (node.data.node as ConditionalData).branches = [
+      { id: "b1", label: "with trace" },
+      { id: "b2", label: "no trace" },
+      { id: "b3", label: "maybe" },
+    ];
+    render(<NodeEditor node={node} catalog={catalog()} onChange={vi.fn()} />);
+
+    expect((screen.getByLabelText("Remove branch maybe") as HTMLButtonElement).disabled).toBe(
+      false,
+    );
+    // Adding is still refused, because the way out of this bound is downwards.
+    expect((screen.getByLabelText("Add branch") as HTMLButtonElement).disabled).toBe(true);
+    expect(
+      screen.getByText(
+        "A rule holds or it does not, so a rule-based conditional decides between exactly two branches (this one has 3 — remove one).",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("given_aRuleBasedConditionalWithTwoBranches_whenRendered_thenNeitherCanBeRemoved", () => {
+    render(<NodeEditor node={ruleConditionalNode()} catalog={catalog()} onChange={vi.fn()} />);
+
+    expect(
+      (screen.getByLabelText("Remove branch with trace") as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("given_aNumericComparisonAgainstANumberNoShellAgreesAbout_whenRendered_thenTheDockSaysSo", () => {
+    render(
+      <NodeEditor
+        node={ruleConditionalNode({ operand: "99999999999999999999" })}
+        catalog={catalog()}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        "'99999999999999999999' has more than 9 digits, and a rule is compared by a shell — only numbers up to 999999999 compare the same way everywhere. The export is refused until it does.",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("given_aConditionalWhoseBranchListHoldsSomethingThatIsNotABranch_whenRendered_thenTheDockStillOpens", () => {
+    // Unreachable through `deserialize`, which rejects such a file — but the traversal in
+    // `workflow-order` guards exactly this shape, and a dock that throws where the rest of
+    // the app degrades is an error boundary swallowing the session instead of one node.
+    const node = conditionalNode();
+    (node.data.node as ConditionalData).branches = [
+      { id: "b1", label: "with trace" },
+      null as unknown as { id: string; label: string },
+    ];
+
+    expect(() =>
+      render(<NodeEditor node={node} catalog={catalog()} onChange={vi.fn()} />),
+    ).not.toThrow();
+    expect((screen.getByLabelText("Branch 1 label") as HTMLInputElement).value).toBe(
+      "with trace",
+    );
+  });
+
+  it.each([
+    ["a padded numeric operand", " 5", false],
+    ["a padded non-number", " five ", true],
+  ])(
+    "given_%s_whenRendered_thenTheDockWarnsExactlyWhenTheExportWould",
+    (_case, operand, warns) => {
+      // The dock's verdict and the export's have to be the same verdict: a padded number is
+      // a number (`comparedOperand` decides that once, for both), so warning here about a
+      // value that exports fine — or staying quiet about one that does not — is the dock
+      // disagreeing with the thing it is previewing.
+      render(
+        <NodeEditor
+          node={ruleConditionalNode({ operand })}
+          catalog={catalog()}
+          onChange={vi.fn()}
+        />,
+      );
+
+      // Specifically the operand's own warning: a rule-based node always shows the
+      // two-branch status line beside it.
+      const warnings = screen
+        .queryAllByRole("status")
+        .map((line) => line.textContent ?? "")
+        .filter((text) => text.includes(operand.trim()));
+      expect(warnings.length > 0).toBe(warns);
+    },
+  );
+
+  it("given_aStringComparisonWhoseOperandIsPadded_whenRendered_thenTheDockSaysThePaddingIsPartOfIt", () => {
+    // Not an error — ` x ` is a legitimate thing to look for — but it is the one place the
+    // author can see it before the export does, and the difference between ` 5` and `5` is
+    // invisible in every other rendered surface.
+    render(
+      <NodeEditor
+        node={ruleConditionalNode({ operator: "equals", operand: " 5" })}
+        catalog={catalog()}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        'This compares against " 5" exactly, spaces included. Trim it if you did not mean them.',
+      ),
+    ).toBeTruthy();
+  });
+
+  it("given_aNumericComparison_whenTheComparisonBecomesAStringOne_thenTheOperandStopsCarryingPaddingItWasIgnoring", () => {
+    // The dock is where the sequence starts, so it is where the normalization is applied:
+    // what is stored after the switch is what was being compared before it.
+    const onChange = vi.fn();
+    const node = ruleConditionalNode({ operator: "greater-than", operand: " 5" });
+    render(<NodeEditor node={node} catalog={catalog()} onChange={onChange} />);
+
+    fireEvent.change(screen.getByLabelText("Comparison"), { target: { value: "equals" } });
+
+    const before = ruleConditionalNode({ operator: "greater-than", operand: " 5" }).data
+      .node as ConditionalData;
+    expect(applied(onChange.mock.calls[0][2], before)).toEqual({
+      ...before,
+      rule: { ...(before.rule as ConditionalRule), operator: "equals", operand: "5" },
+    });
+  });
+
+  it("given_aBranchListHoldingSomethingThatIsNotABranch_whenAnotherBranchIsEditedOrRemoved_thenNothingThrows", () => {
+    // The write side of the same tolerance the render side has: a handler that dereferences
+    // `.id` on every entry would throw on the *good* branch's own button, which is the one
+    // the user can actually reach.
+    const onChange = vi.fn();
+    const node = conditionalNode();
+    (node.data.node as ConditionalData).branches = [
+      { id: "b1", label: "with trace" },
+      null as unknown as { id: string; label: string },
+      { id: "b2", label: "no trace" },
+    ];
+    render(<NodeEditor node={node} catalog={catalog()} onChange={onChange} />);
+
+    expect(() =>
+      fireEvent.change(screen.getByLabelText("Branch 1 label"), {
+        target: { value: "renamed" },
+      }),
+    ).not.toThrow();
+    expect(() =>
+      fireEvent.click(screen.getByLabelText("Remove branch with trace")),
+    ).not.toThrow();
+
+    // Applied against the list **as it actually is** — the malformed entry included — since
+    // the edit is an updater over the node's current data, which is where a handler that
+    // dereferences every entry would actually throw.
+    const current = () =>
+      ({
+        ...(conditionalNode().data.node as ConditionalData),
+        branches: [
+          { id: "b1", label: "with trace" },
+          null as unknown as { id: string; label: string },
+          { id: "b2", label: "no trace" },
+        ],
+      }) as ConditionalData;
+
+    const renamed = applied(onChange.mock.calls[0][2], current()) as ConditionalData;
+    expect(renamed.branches[0]).toEqual({ id: "b1", label: "renamed" });
+    const removed = applied(onChange.mock.calls[1][2], current()) as ConditionalData;
+    expect(removed.branches.some((b) => b?.id === "b1")).toBe(false);
+    // Untouched entries survive, including the one nothing can address.
+    expect(removed.branches).toHaveLength(2);
+  });
+
+  it("given_aRuleBasedConditional_whenRendered_thenItSaysWhoDecidesAtRunTime", () => {
+    render(<NodeEditor node={ruleConditionalNode()} catalog={catalog()} onChange={vi.fn()} />);
+
+    expect(
+      screen.getByText(
+        "Claude Code measures the value above and the control scaffold exported with this workflow compares it, so the same measured value always takes the same branch.",
+      ),
+    ).toBeTruthy();
   });
 });
