@@ -169,3 +169,40 @@ describe("ConditionalNode — which of the two things decides this branch", () =
     },
   );
 });
+
+describe("ConditionalNode — the loop guard is read off the canvas", () => {
+  /** What this node says about passes, asked of the node rather than of the document. */
+  function passesLine(container: HTMLElement): string | undefined {
+    return [...container.querySelectorAll(".pw-node__detail")]
+      .map((detail) => detail.textContent ?? "")
+      .find((text) => text.startsWith("loops at most"));
+  }
+
+  it("given_aGuardedConditional_whenRendered_thenItSaysHowManyPassesItsLoopMayRun", () => {
+    // How many times a workflow can go round is part of reading it, so it belongs on the
+    // node beside the mode rather than only in the dock, one node at a time.
+    const { container } = conditionalWith(2, { maxIterations: 3 });
+
+    expect(passesLine(container)).toBe("loops at most 3 passes");
+  });
+
+  it("given_aGuardOfOne_whenRendered_thenItIsCountedInTheSingular", () => {
+    const { container } = conditionalWith(2, { maxIterations: 1 });
+
+    expect(passesLine(container)).toBe("loops at most 1 pass");
+  });
+
+  it("given_aConditionalWithNoGuard_whenRendered_thenNothingIsClaimedAboutPasses", () => {
+    const { container } = conditionalWith(2);
+
+    expect(passesLine(container)).toBeUndefined();
+  });
+
+  it("given_aGuardThatCouldNotStopALoop_whenRendered_thenItIsNotShownAsABound", () => {
+    // `loopGuardOf` is the one read of the field, so the canvas cannot show a bound the
+    // validator refuses as though the loop were bounded by it.
+    const { container } = conditionalWith(2, { maxIterations: 0 });
+
+    expect(passesLine(container)).toBeUndefined();
+  });
+});

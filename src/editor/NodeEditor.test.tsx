@@ -920,3 +920,76 @@ describe("NodeEditor — choosing what decides a Conditional", () => {
     ).toBeTruthy();
   });
 });
+
+describe("NodeEditor — the max-iteration guard of a loop gate", () => {
+  const GUARD = "Max passes, when a branch loops back";
+
+  it("given_aConditionalNode_whenRendered_thenTheGuardIsOfferedAndEmpty", () => {
+    // Offered on every conditional, because whether this node is a loop gate depends on
+    // where an edge goes and the dock only sees the node — and empty, because a bound
+    // nobody chose is precisely what an unguarded loop is.
+    render(<NodeEditor node={conditionalNode()} catalog={catalog()} onChange={vi.fn()} />);
+
+    expect((screen.getByLabelText(GUARD) as HTMLInputElement).value).toBe("");
+  });
+
+  it("given_aGuardTyped_whenEdited_thenItIsStoredAsANumberAndNothingElseChanges", () => {
+    const onChange = vi.fn();
+    render(<NodeEditor node={conditionalNode()} catalog={catalog()} onChange={onChange} />);
+
+    fireEvent.change(screen.getByLabelText(GUARD), { target: { value: "4" } });
+
+    expect(applied(onChange.mock.calls[0][2], conditionalNode().data.node)).toEqual({
+      mode: "llm",
+      question: "Does the report contain a stack trace?",
+      maxIterations: 4,
+      branches: [
+        { id: "b1", label: "with trace" },
+        { id: "b2", label: "no trace" },
+      ],
+    });
+  });
+
+  it("given_aGuardedConditional_whenTheGuardIsCleared_thenTheFieldIsRemovedRatherThanZeroed", () => {
+    // No guard and a guard of nothing are different documents, and only one of them
+    // exports: clearing the field has to produce the first.
+    const node = conditionalNode();
+    (node.data.node as ConditionalData).maxIterations = 4;
+    const onChange = vi.fn();
+    render(<NodeEditor node={node} catalog={catalog()} onChange={onChange} />);
+
+    fireEvent.change(screen.getByLabelText(GUARD), { target: { value: "" } });
+
+    expect(applied(onChange.mock.calls[0][2], node.data.node)).not.toHaveProperty(
+      "maxIterations",
+    );
+  });
+
+  it("given_aGuardedConditional_whenRendered_thenTheStoredGuardIsShown", () => {
+    const node = conditionalNode();
+    (node.data.node as ConditionalData).maxIterations = 7;
+    render(<NodeEditor node={node} catalog={catalog()} onChange={vi.fn()} />);
+
+    expect((screen.getByLabelText(GUARD) as HTMLInputElement).value).toBe("7");
+  });
+
+  it("given_aGuardThatCouldNotStopALoop_whenRendered_thenTheDockSaysSoBeforeTheExportDoes", () => {
+    // The dock's verdict is the validator's, through `loopGuardOf`: "the export was
+    // refused" is a poor place to learn that a loop's bound has to be a whole number.
+    const node = conditionalNode();
+    (node.data.node as ConditionalData).maxIterations = 0;
+    render(<NodeEditor node={node} catalog={catalog()} onChange={vi.fn()} />);
+
+    expect(
+      screen.getByText(/is not a number of passes a loop can be stopped at/),
+    ).toBeTruthy();
+  });
+
+  it("given_aUsableGuard_whenRendered_thenNothingIsFlagged", () => {
+    const node = conditionalNode();
+    (node.data.node as ConditionalData).maxIterations = 3;
+    render(<NodeEditor node={node} catalog={catalog()} onChange={vi.fn()} />);
+
+    expect(screen.queryByText(/is not a number of passes/)).toBeNull();
+  });
+});

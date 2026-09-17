@@ -15,20 +15,20 @@ import {
 // it: the compiler emits it, and validation asks it whether the graph can be
 // followed at all. `workflow-order` depends on this module for types only, so the
 // two never touch each other's bindings while either is still evaluating.
-import { fanInInputs, nestingDepth, planWorkflow } from "./workflow-order";
-import type { WorkflowPlan } from "./workflow-order";
+import { fanInInputs, loopBacks, nestingDepth, planWorkflow } from "./workflow-order";
+import type { LoopBack, WorkflowPlan } from "./workflow-order";
 
 /**
- * Bumped to 5 in slices 5 and 7: a `conditional` node can be **rule-based** (the
- * `rule` its `mode` selects, evaluated by the exported control scaffold rather
- * than by the model), and an edge can carry the `inputLabel` its result arrives
- * under where several paths fan in.
+ * Bumped to 6 in slice 6: a `conditional` node can carry `maxIterations`, the
+ * max-iteration guard it enforces as a **loop gate** — the bound on how many passes
+ * a branch that loops back may run (ADR-0006).
  *
- * (4 added the `conditional` node type and an edge's `branch`; 3 recorded, per
+ * (5 made a `conditional` optionally **rule-based** and gave an edge its `inputLabel`;
+ * 4 added the `conditional` node type and an edge's `branch`; 3 recorded, per
  * `skill`/`agent` node, *how* it is exported — referenced by name, or
  * vendor-copied into the bundle.) `deserialize` migrates older documents forward.
  */
-export const CURRENT_SCHEMA_VERSION = 5;
+export const CURRENT_SCHEMA_VERSION = 6;
 
 /** The oldest document version that still opens (via forward migration). */
 export const MIN_SUPPORTED_SCHEMA_VERSION = 1;
@@ -380,12 +380,61 @@ export interface ConditionalData {
    * which is why an ignored rule is not a validation error.
    */
   rule?: ConditionalRule;
+  /**
+   * The **max-iteration guard** (loop gate), read through [`loopGuardOf`].
+   *
+   * How many times the loop body may run before this gate must leave the loop, counted
+   * and enforced by the exported control scaffold rather than promised by prose
+   * (ADR-0006). Optional because most conditionals are not loop gates: a node whose
+   * branches all lead onwards has nothing to bound, and `validateGraph` asks for a guard
+   * exactly when a branch of this node loops back.
+   *
+   * Kept when the loop is unwired, the way an ignored `rule` is: rerouting an edge to
+   * look at the graph without the loop must not cost the user the bound they chose.
+   */
+  maxIterations?: number;
   branches: Branch[];
 }
 
 /** The branching mode a conditional node's stored data asks for. */
 export function conditionalModeOf(data: ConditionalData): ConditionalMode {
   return data.mode ?? DEFAULT_CONDITIONAL_MODE;
+}
+
+/**
+ * The fewest passes a loop can be allowed and still be a loop the export can describe.
+ *
+ * One, not zero: a guard of one means the body runs once and the gate then leaves, which
+ * is the loop drawn and never taken — a shape with a meaning. Zero would mean the steps
+ * inside the loop never run at all, which is not a bound on a workflow but a way of
+ * deleting part of one without deleting it from the canvas.
+ */
+export const MIN_LOOP_ITERATIONS = 1;
+
+/**
+ * The most passes a loop can be allowed.
+ *
+ * The scaffold claims one file per pass and compares the pass it took with `[ -ge ]`, so the
+ * bound is [`MAX_RULE_NUMBER_DIGITS`]' bound and for exactly its reason: past nine digits
+ * the comparison is a shell's own integer type and the shells disagree, silently. Deriving it
+ * here rather than naming a second number keeps the two halves of the scaffold's arithmetic
+ * bounded by one rule.
+ */
+export const MAX_LOOP_ITERATIONS = Number("9".repeat(MAX_RULE_NUMBER_DIGITS));
+
+/**
+ * The guard a conditional's stored data asks for, or `undefined` when it has none the
+ * scaffold could enforce.
+ *
+ * The check is part of the read, deliberately: a guard that is not a whole number in range
+ * is not a smaller guard or a larger one, it is *no* guard — and every consumer (the
+ * validator, the compiler, the canvas, the dock) has to agree about that, or a document one
+ * of them calls guarded is one another exports unbounded.
+ */
+export function loopGuardOf(data: ConditionalData): number | undefined {
+  const guard = data.maxIterations;
+  if (typeof guard !== "number" || !Number.isInteger(guard)) return undefined;
+  return guard >= MIN_LOOP_ITERATIONS && guard <= MAX_LOOP_ITERATIONS ? guard : undefined;
 }
 
 /**
@@ -656,6 +705,12 @@ export function validateGraph(doc: PatchworkDocument): ValidationResult {
   errors.push(...branchWiringErrors(doc, nodeIds));
   errors.push(...inputLabelErrors(doc));
 
+  // Asked once and handed to both checks below, because a loop is one fact with two
+  // consequences: which edges close a cycle decides what `structureErrors` may still call a
+  // cycle, and which conditionals are gates decides who owes a guard.
+  const loops = loopBacks(doc);
+  errors.push(...loopErrors(doc, loops));
+
   // Checked here, ahead of the plan, because everything below is a function of the size and
   // the plan is the most expensive of them. See [`MAX_WORKFLOW_NODES`].
   const tooLarge = doc.nodes.length > MAX_WORKFLOW_NODES;
@@ -665,7 +720,7 @@ export function validateGraph(doc: PatchworkDocument): ValidationResult {
     );
   }
 
-  const structure = structureErrors(doc, nodeIds);
+  const structure = structureErrors(doc, nodeIds, loops);
   errors.push(...structure.errors);
   // The plan is what `compile` walks, so asking it is how "this graph can be
   // followed" is checked once rather than re-derived here — but only for an
@@ -1239,21 +1294,87 @@ function artifactRefErrors(node: GraphNode): string[] {
   return errors;
 }
 
+/**
+ * Reject a loop the exported bundle could not bound, or could not leave.
+ *
+ * Every rule here is about the *script the compiler will emit*, the way [`ruleErrors`] is:
+ * the scaffold counts one loop's passes against one number and then prints the label of the
+ * one branch that leaves the loop, so a gate with no usable guard has nothing to count
+ * against, a gate with more than two branches leaves it no single answer, and a gate whose
+ * every branch loops has no way out to print.
+ *
+ * **The guard is the whole point of the slice, so its absence is the error, not a
+ * default.** A loop with an assumed bound is a workflow that runs a number of times nobody
+ * chose; a loop with no bound at all is one an exported bundle can be made to run forever,
+ * which is exactly what an unguarded cycle means and why `validateGraph` used to refuse
+ * every cycle outright (ADR-0006).
+ */
+function loopErrors(
+  doc: PatchworkDocument,
+  loops: ReadonlyMap<string, LoopBack>,
+): string[] {
+  const errors: string[] = [];
+  /** The loop-backs each gate carries, so a gate is reported once however many it has. */
+  const byGate = new Map<string, LoopBack[]>();
+  for (const loop of loops.values()) {
+    const found = byGate.get(loop.gate.id) ?? [];
+    found.push(loop);
+    byGate.set(loop.gate.id, found);
+  }
+
+  // Document order, not map order: an error list a user reads twice must read the same way.
+  for (const node of doc.nodes) {
+    const gateLoops = byGate.get(node.id);
+    if (gateLoops === undefined) continue;
+    const data = node.data as ConditionalData | undefined;
+    const branches = branchesOf(node);
+
+    // A gate with no `data` at all is a gate with no guard, and is reported as one. It
+    // never reaches here today — the shape check ahead of this throws on it first (#27) —
+    // and it is guarded anyway, the way [`loopPointOf`] guards: this file's convention for
+    // reading a conditional's data is to ask whether it is there, and the one reader that
+    // does not ask is the one that throws the day the check ahead of it stops throwing.
+    if (data === undefined || loopGuardOf(data) === undefined) {
+      const stated =
+        data?.maxIterations === undefined
+          ? "has no max-iteration guard"
+          : `is guarded by '${String(data.maxIterations)}', which is not a number of passes it could be stopped at`;
+      errors.push(
+        `Conditional node '${node.id}' is a loop gate — edge ${gateLoops[0].edge.id} leads back to node '${gateLoops[0].target.id}' — but it ${stated}; give it a maximum number of passes between ${MIN_LOOP_ITERATIONS} and ${MAX_LOOP_ITERATIONS}, which the exported control scaffold counts and stops the loop at`,
+      );
+    }
+
+    if (gateLoops.length === branches.length) {
+      errors.push(
+        `Conditional node '${node.id}' is a loop gate whose every branch leads back into the loop; one of its branches must leave, or the exported workflow has no way out to take when the passes run out`,
+      );
+    } else if (branches.length !== 2) {
+      errors.push(
+        `Conditional node '${node.id}' is a loop gate and offers ${branches.length} branches; a loop gate decides between going round again and leaving the loop, so it decides between exactly two`,
+      );
+    }
+  }
+  return errors;
+}
+
 /** Structural verdict: the errors found, and whether the plan check can run. */
 interface StructureVerdict {
   errors: string[];
   /**
-   * True when the graph is a single-entry acyclic graph, i.e. when following it is
-   * a well-defined thing to do. Only then is the plan check in `validateGraph`
-   * meaningful: without one Input there is nowhere to start, and with a cycle every
-   * node on it is trivially "reached more than once".
+   * True when the graph has a single entry and no cycle a loop gate does not close,
+   * i.e. when following it is a well-defined thing to do. Only then is the plan check in
+   * `validateGraph` meaningful: without one Input there is nowhere to start, and with an
+   * unclosed cycle every node on it is trivially "reached more than once". A **loop** is
+   * not such a cycle — the walk does not follow a loop-back — so a guarded loop is
+   * walkable and gets the plan check like any other document.
    */
   walkable: boolean;
 }
 
 /**
- * Enforce that the graph runs from the one Input to the one Output with no orphans
- * and no cycles, and that it fans out only where a fan-out means something.
+ * Enforce that the graph runs from the one Input to the one Output with no orphans and no
+ * cycle that no loop gate closes, and that it fans out only where a fan-out means
+ * something.
  *
  * Slice 1 was linear-only. Slice 4 relaxed the shape and slice 7 finished the job:
  *
@@ -1271,10 +1392,17 @@ interface StructureVerdict {
  * The "leads somewhere" rule is new and belongs to fan-out: in a chain, one Output
  * plus connectivity already forced every node to lead on, but a branch can now end
  * mid-air while every node is still reachable.
+ *
+ * Slice 6 relaxed the last of it: a **cycle a loop gate closes** is a loop, which is a shape
+ * the export can bound rather than one it must refuse, so the walk steps over the loop-backs
+ * and what is left to report is the cycle nobody put a gate on. Whether each gate can
+ * actually be bounded is [`loopErrors`]', for the same reason branch wiring is
+ * [`branchWiringErrors`]': one shape, one function that speaks about it.
  */
 function structureErrors(
   doc: PatchworkDocument,
   nodeIds: Set<string>,
+  loops: ReadonlyMap<string, LoopBack>,
 ): StructureVerdict {
   const errors: string[] = [];
   const outDeg = new Map<string, number>();
@@ -1285,6 +1413,12 @@ function structureErrors(
     if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) continue;
     outDeg.set(edge.source, (outDeg.get(edge.source) ?? 0) + 1);
     inDeg.set(edge.target, (inDeg.get(edge.target) ?? 0) + 1);
+    // Degrees count every edge — a loop-back is an outgoing edge of its gate and an
+    // incoming one of its target, which is what both of them look like on the canvas —
+    // but the walk below does not follow one. A loop-back is how a workflow goes round
+    // again, not a way further in, and following it would report the loop the user
+    // deliberately drew as the cycle this function exists to refuse.
+    if (loops.has(edge.id)) continue;
     const list = adjacency.get(edge.source) ?? [];
     list.push(edge.target);
     adjacency.set(edge.source, list);
@@ -1358,7 +1492,9 @@ function structureErrors(
   }
 
   if (cycleNode) {
-    errors.push(`Graph contains a cycle through '${cycleNode}'`);
+    errors.push(
+      `Graph contains a cycle through '${cycleNode}' that no Conditional loop gate closes; a workflow may loop only through a Conditional whose branch leads back, so the exported scaffold has somewhere to count the passes and stop`,
+    );
   } else {
     for (const node of doc.nodes) {
       if (!visited.has(node.id)) {
@@ -1488,6 +1624,10 @@ const MIGRATIONS: Record<number, (doc: PatchworkDocument) => PatchworkDocument> 
   // which is exactly what it still means, and no v4 edge carries an input label — so
   // a v4 document is already a valid v5 document.
   4: (doc) => ({ ...doc, schemaVersion: 5 }),
+  // v5 -> v6: a conditional's `maxIterations`. A widening once more — no v5 document
+  // holds one, because no v5 document may contain a cycle at all — so a v5 document is
+  // already a valid v6 document, and the migration only records the version it opens at.
+  5: (doc) => ({ ...doc, schemaVersion: 6 }),
 };
 
 function migrateToCurrent(doc: PatchworkDocument): PatchworkDocument {
@@ -1649,6 +1789,16 @@ function assertNodeShape(raw: unknown, index: number): void {
       ) {
         throw new Error(
           `Conditional node '${id}' has an invalid 'mode' '${String(data.mode)}' (expected one of ${CONDITIONAL_MODES.join(", ")})`,
+        );
+      }
+      // A guard is a *number* here, and only that: `validateGraph` decides whether it is a
+      // number of passes a loop can be stopped at, but a string or an object would reach
+      // the emitter as one and be rendered into generated shell as whatever it stringifies
+      // to. Absent is fine — that is every document written before loops existed, and every
+      // conditional that is not a loop gate.
+      if (data.maxIterations !== undefined && typeof data.maxIterations !== "number") {
+        throw new Error(
+          `Conditional node '${id}' must have a numeric 'maxIterations' when present (found ${describeType(data.maxIterations)})`,
         );
       }
       // The rule's *shape*, for the same reason every other `data` contract is checked

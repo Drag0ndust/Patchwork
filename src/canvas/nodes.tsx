@@ -3,6 +3,7 @@ import {
   branchesWithinLimit,
   conditionalModeOf,
   describeRule,
+  loopGuardOf,
   MAX_BRANCHES_PER_CONDITIONAL,
   type ArtifactRefData,
   type ConditionalData,
@@ -137,6 +138,11 @@ export function ConditionalNode({ data, selected }: NodeProps<PatchNode>) {
         ? "no rule"
         : summarize(describeRule(rule))
       : summarize(conditional?.question ?? "") || "no question";
+  // The guard is shown on the node for the reason the mode is: how many times a workflow
+  // can go round is read off the canvas, not out of the dock one node at a time. Shown
+  // whenever it is set, because whether it is *used* is a property of the edges rather than
+  // of this node — and a bound the user typed and cannot see is a bound they cannot check.
+  const guard = loopGuardOf(conditional ?? { question: "", branches: [] });
   const branches = Array.isArray(conditional?.branches) ? conditional.branches : [];
   const overWidth = branches.length > MAX_BRANCHES_PER_CONDITIONAL;
   const drawn = branchesWithinLimit(branches);
@@ -153,6 +159,11 @@ export function ConditionalNode({ data, selected }: NodeProps<PatchNode>) {
       </header>
       <div className="pw-node__label">{data.label || "Untitled conditional"}</div>
       <div className="pw-node__detail">{detail}</div>
+      {guard !== undefined && (
+        <div className="pw-node__detail">
+          {`loops at most ${guard} ${guard === 1 ? "pass" : "passes"}`}
+        </div>
+      )}
       <ul className="pw-node__branches">
         {drawn.map((branch) => (
           <li key={branch.id} className="pw-node__branch">

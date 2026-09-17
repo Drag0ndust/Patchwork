@@ -16,6 +16,12 @@
  * converge — but it shares the conditional's scoping, which is what stops a path *before*
  * the convergence point so the merge is instructed once (see [`pushWalks`]).
  *
+ * Slice 6 closes the shape: a workflow may **loop**. A `conditional` whose branch arrives
+ * back at a node the walk is already inside is a **loop gate**, and that branch is a
+ * loop-back ([`loopBacks`]). A loop-back is planned rather than walked — its steps are the
+ * ones already between its target and its gate — so the plan stays a finite, acyclic
+ * structure while carrying where the next pass restarts ([`PlannedBranch.loopBackTo`]).
+ *
  * Two consumers, deliberately the same traversal:
  *
  * - the **Graph Compiler**, which renders the segments as the umbrella's numbered
@@ -68,6 +74,32 @@ export interface PlannedBranch {
    * of this conditional converges. Empty when the branch goes straight there.
    */
   segments: FlowSegment[];
+  /**
+   * The node the next pass restarts at, when this branch **loops back** — the target
+   * of the edge that closes the cycle (see [`loopBacks`]).
+   *
+   * A looping branch has no `segments` of its own, deliberately: the steps it runs are
+   * the ones already planned between its target and this gate, and planning them twice
+   * would instruct them twice. What it carries instead is where to go back to, which is
+   * the one thing a reader of the plan cannot derive from the segment list.
+   */
+  loopBackTo?: GraphNode;
+}
+
+/**
+ * One loop-back: the branch edge that closes a cycle, the `conditional` it leaves — the
+ * **loop gate** — and the node the next pass restarts at.
+ *
+ * The gate is what makes a cycle followable rather than endless: it is the point at which
+ * the workflow asks whether to go round again, and it is the node that carries the
+ * max-iteration guard the exported control scaffold enforces (ADR-0006).
+ */
+export interface LoopBack {
+  edge: GraphEdge;
+  /** The `conditional` whose branch loops — the loop gate. */
+  gate: GraphNode;
+  /** Where the next pass restarts. */
+  target: GraphNode;
 }
 
 export interface WorkflowPlan {
@@ -162,17 +194,136 @@ function pushWalks(
   for (let at = queued.length - 1; at >= 0; at -= 1) jobs.push(queued[at]);
 }
 
+/**
+ * Every **loop-back** edge in the document, keyed by edge id.
+ *
+ * A loop-back is an edge that leaves a `conditional` on one of its branches and arrives at
+ * a node the walk is **currently inside** — the node it came from, or one it came through.
+ * Taking that branch is what going round again means, and the `conditional` it leaves is
+ * the **loop gate**: the point at which the workflow asks whether to run the body once
+ * more, and the node that carries the max-iteration guard the exported control scaffold
+ * enforces (ADR-0006).
+ *
+ * Everything else about loops is defined in terms of this one set. [`planWorkflow`] walks
+ * the graph with these edges taken out — which is what makes the walk finite and every
+ * other traversal here a DAG traversal again — `validateGraph` refuses a cycle that *no*
+ * such edge breaks, and the Graph Compiler emits the guard that bounds the passes.
+ *
+ * **"Already inside", not "points backwards" and not "sits on a cycle".** The test is
+ * whether the target is on the depth-first path being walked when the edge is reached,
+ * which is precisely the condition under which walking it would instruct a step a second
+ * time. Neither cheaper rule says that:
+ *
+ * - *points backwards* is about the drawing, and a workflow's node list has no order the
+ *   user maintains;
+ * - *sits on a cycle* (both endpoints in one strongly connected component) also catches
+ *   the branch that **enters** the loop from outside. `assess -> gate`, `gate --b--> B`,
+ *   `B -> assess` is one component, so that rule called `gate --b--> B` the loop-back,
+ *   dropped it from the walk, and left `B` unreachable — a step the user drew, silently
+ *   outside their workflow.
+ *
+ * The depth-first search runs from the Input node and then from anything it did not
+ * reach, taking nodes and edges in document order, so the answer is a function of the
+ * document rather than of iteration accident. Where a cycle carries two gate branches that
+ * could each be read as its loop-back, the first one the search meets is the one — the same
+ * "first edge wins" rule the walk already applies to a branch wired twice.
+ *
+ * That is a **tie-break, not a judgement**, and the classification is order-stable for every
+ * document: asked twice, this answers the same, and two documents that differ only in which
+ * edge leads into the cycle are two different workflows — the guard is then owed by a
+ * different gate — rather than one workflow read two ways.
+ *
+ * Iterative, and total: nothing here throws for any document, and no chain is too deep.
+ */
+export function loopBacks(doc: PatchworkDocument): Map<string, LoopBack> {
+  const byId = new Map(doc.nodes.map((node) => [node.id, node]));
+  const outgoing = new Map<string, GraphEdge[]>();
+  for (const edge of doc.edges) {
+    if (!byId.has(edge.source) || !byId.has(edge.target)) continue;
+    const list = outgoing.get(edge.source);
+    if (list) list.push(edge);
+    else outgoing.set(edge.source, [edge]);
+  }
+
+  const found = new Map<string, LoopBack>();
+  // On the current depth-first path — the colouring `validateGraph`'s own cycle check uses,
+  // in the one place that now decides what a cycle *means*.
+  const onPath = new Set<string>();
+  const seen = new Set<string>();
+
+  const input = doc.nodes.find((node) => node.type === "input");
+  // The Input first, so the search starts where the workflow does; then anything it did not
+  // reach, in document order, so a cycle off to one side is classified too.
+  const starts = input === undefined ? doc.nodes : [input, ...doc.nodes];
+  for (const start of starts) {
+    if (seen.has(start.id)) continue;
+    seen.add(start.id);
+    onPath.add(start.id);
+    const frames: Array<{ id: string; next: number }> = [{ id: start.id, next: 0 }];
+    while (frames.length > 0) {
+      const frame = frames[frames.length - 1];
+      const edges = outgoing.get(frame.id) ?? [];
+      if (frame.next >= edges.length) {
+        onPath.delete(frame.id);
+        frames.pop();
+        continue;
+      }
+      const edge = edges[frame.next];
+      frame.next += 1;
+      if (onPath.has(edge.target)) {
+        const gate = byId.get(edge.source) as GraphNode;
+        const target = byId.get(edge.target) as GraphNode;
+        // Only a *branch* of a conditional loops. Any other edge that closes a cycle is a
+        // cycle with nothing to decide whether it runs again — the one `validateGraph`
+        // refuses, and the one this deliberately does not rescue.
+        if (
+          gate.type === "conditional" &&
+          edge.branch !== undefined &&
+          edge.branch !== "" &&
+          !found.has(edge.id)
+        ) {
+          found.set(edge.id, { edge, gate, target });
+        }
+        continue;
+      }
+      if (seen.has(edge.target)) continue;
+      seen.add(edge.target);
+      onPath.add(edge.target);
+      frames.push({ id: edge.target, next: 0 });
+    }
+  }
+  return found;
+}
+
 /** Plan the order a document runs in. Pure; never throws. */
 export function planWorkflow(
   doc: PatchworkDocument,
   options: PlanOptions = {},
 ): WorkflowPlan {
   const byId = new Map(doc.nodes.map((n) => [n.id, n]));
+  // The loop-backs, indexed by the gate and branch they leave by, so the walk can ask the
+  // question it has at hand ("does *this* branch loop?") rather than re-deriving the rule.
+  const loops = loopBacks(doc);
+  const looping = new Map<string, Map<string, LoopBack>>();
+  for (const loop of loops.values()) {
+    const branches = looping.get(loop.gate.id) ?? new Map<string, LoopBack>();
+    branches.set(loop.edge.branch as string, loop);
+    looping.set(loop.gate.id, branches);
+  }
+
   const outgoing = new Map<string, GraphEdge[]>();
   for (const edge of doc.edges) {
     // Edges with a missing endpoint are `validateGraph`'s to report; following one
     // would mean walking to a node that does not exist.
     if (!byId.has(edge.source) || !byId.has(edge.target)) continue;
+    // A loop-back is followed by *going round again*, not by walking on: its steps are the
+    // ones already planned between its target and its gate, and walking it would plan them
+    // a second time — which is the "reached more than once" problem, i.e. the reading in
+    // which a loop is a defect. Taken out here, every traversal below is a DAG traversal
+    // again: the walk terminates, the topological order is total, and the transitive
+    // closure (which a cycle would fill wrongly) is available. Where the branch went is
+    // not lost — it is carried on the branch that loops, as [`PlannedBranch.loopBackTo`].
+    if (loops.has(edge.id)) continue;
     const list = outgoing.get(edge.source);
     if (list) list.push(edge);
     else outgoing.set(edge.source, [edge]);
@@ -264,10 +415,15 @@ export function planWorkflow(
       }
 
       const join = convergence([...new Set(heads.values())], indexOf());
-      const planned: PlannedBranch[] = branchesOf(node).map((branch) => ({
-        branch,
-        segments: [],
-      }));
+      const branchLoops = looping.get(node.id);
+      const planned: PlannedBranch[] = branchesOf(node).map((branch) => {
+        // `branch?.id`, like every other read of a branch entry: a hand-built document may
+        // hold anything in that array.
+        const loop = branchLoops?.get(branch?.id as string);
+        return loop === undefined
+          ? { branch, segments: [] }
+          : { branch, segments: [], loopBackTo: loop.target };
+      });
       job.collect.push({ kind: "branch", node, branches: planned });
 
       const bodies: WalkBody[] = [];
@@ -427,8 +583,9 @@ export interface FanInInput {
  *   the distinction this exists to make: a fan-in **concatenates** its inputs under
  *   labels, while a loop-back carries the next pass's value and **replaces** what the step
  *   worked on last time. Counting incoming edges cannot tell them apart — direction can.
- *   (Loops are a later slice and a cycle is refused meanwhile; what is settled here is
- *   that when they land, a back edge does not silently become a second labelled input.)
+ *   (Slice 6 landed the loops this was written for, and a loop-back is a *branch* edge on
+ *   top of being a backward one, so it is excluded twice over — which is the point: the
+ *   step it returns to is told its input is replaced, never concatenated.)
  *
  * A node with a single input is absent: one result needs no name, and nothing about it
  * can be ambiguous.
