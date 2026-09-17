@@ -7,9 +7,12 @@ import {
   exportModeOf,
   isComparableNumber,
   isWholeNumber,
+  loopGuardOf,
   MAX_BRANCHES_PER_CONDITIONAL,
+  MAX_LOOP_ITERATIONS,
   MAX_RULE_NUMBER_DIGITS,
   MIN_BRANCHES_PER_CONDITIONAL,
+  MIN_LOOP_ITERATIONS,
   NUMERIC_RULE_OPERATORS,
   type ArtifactRefData,
   type Branch,
@@ -538,6 +541,7 @@ function ConditionalFields({
           }
         />
       )}
+      <LoopGuardField data={data} onChange={onChange} />
       <div className="pw-field pw-field--grow">
         <span>
           Branches ({branches.length} of {MAX_BRANCHES_PER_CONDITIONAL})
@@ -616,6 +620,75 @@ function ConditionalFields({
             : "The exported scaffold prints one of these labels and Claude Code follows that branch. Wire each branch from its own handle on the node."}
         </p>
       </div>
+    </>
+  );
+}
+
+/**
+ * Edit the max-iteration guard: how many passes a loop through this conditional may run.
+ *
+ * Offered on **every** conditional rather than only on the ones that loop, because the dock
+ * edits one node and the loop is a property of the *graph* — the same node is a loop gate or
+ * not depending on where an edge goes, and a field that appeared and disappeared as the user
+ * wired the canvas would be a field they could not find. What it says instead is when it is
+ * used, and `validateGraph` is what asks for it, naming the node and the edge (ADR-0006).
+ *
+ * Empty means **no guard**, which is why the control is not a number spinner with a default:
+ * a guard nobody chose is the thing the slice exists to prevent, so the absence has to be
+ * expressible and has to be the starting state.
+ */
+function LoopGuardField({
+  data,
+  onChange,
+}: {
+  data: ConditionalData;
+  onChange: (edit: (current: ConditionalData) => ConditionalData) => void;
+}) {
+  const written = data.maxIterations;
+  // Said here, not only at export: "the export was refused" is a poor place to learn that a
+  // loop's bound has to be a whole number of passes. `loopGuardOf` is the schema's own read,
+  // so the dock's verdict is the validator's rather than a third spelling of it.
+  const problem =
+    written === undefined || loopGuardOf(data) !== undefined
+      ? undefined
+      : `'${String(written)}' is not a number of passes a loop can be stopped at — give it a whole number between ${MIN_LOOP_ITERATIONS} and ${MAX_LOOP_ITERATIONS}, or clear it.`;
+
+  return (
+    <>
+      <label className="pw-field">
+        <span>Max passes, when a branch loops back</span>
+        <input
+          type="number"
+          min={MIN_LOOP_ITERATIONS}
+          max={MAX_LOOP_ITERATIONS}
+          step={1}
+          value={written === undefined ? "" : String(written)}
+          onChange={(e) => {
+            // Captured before the updater, as everywhere else in this dock.
+            const typed = e.target.value.trim();
+            // Empty clears the guard rather than storing a zero: no guard and a guard of
+            // nothing are different documents, and only one of them exports.
+            const guard = typed === "" ? undefined : Number(typed);
+            onChange((current) => {
+              const next = { ...current };
+              if (guard === undefined || Number.isNaN(guard)) delete next.maxIterations;
+              else next.maxIterations = guard;
+              return next;
+            });
+          }}
+          placeholder="e.g. 3"
+        />
+      </label>
+      {problem !== undefined && (
+        <p className="pw-ref pw-ref--unresolved" role="status">
+          {problem}
+        </p>
+      )}
+      <p className="pw-ref">
+        Used only when one of this node's branches leads back to an earlier step. The control
+        scaffold exported with this workflow counts the passes and takes the other branch
+        once they run out, so a loop cannot run forever.
+      </p>
     </>
   );
 }

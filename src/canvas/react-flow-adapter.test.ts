@@ -801,3 +801,126 @@ describe("withInputLabels — a fan-in says on the canvas what each path carries
     expect(labelled.find((e) => e.id === "e3")?.label).toBe("Draft");
   });
 });
+
+/**
+ * A loop drawn on the canvas: the gate's `again` branch is wired back to an earlier node.
+ *
+ * ```
+ * i -> draft -> gate -- again --> (back to draft)
+ *                    \- done  --> o
+ * ```
+ */
+function loopDoc(): PatchworkDocument {
+  return {
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    workflow: { name: "Loop", description: "d" },
+    nodes: [
+      {
+        id: "i",
+        type: "input",
+        label: "Topic",
+        data: { parameters: [{ name: "topic" }] },
+        position: { x: 0, y: 0 },
+      },
+      {
+        id: "draft",
+        type: "prompt",
+        label: "Draft",
+        data: { instruction: "draft" },
+        position: { x: 100, y: 0 },
+      },
+      {
+        id: "gate",
+        type: "conditional",
+        label: "Good enough?",
+        data: {
+          mode: "llm",
+          question: "Good enough?",
+          maxIterations: 3,
+          branches: [
+            { id: "again", label: "revise" },
+            { id: "done", label: "ship" },
+          ],
+        },
+        position: { x: 200, y: 0 },
+      },
+      {
+        id: "o",
+        type: "output",
+        label: "Result",
+        data: { description: "r" },
+        position: { x: 300, y: 0 },
+      },
+    ],
+    edges: [
+      { id: "e1", source: "i", target: "draft" },
+      { id: "e2", source: "draft", target: "gate" },
+      { id: "e3", source: "gate", target: "draft", branch: "again" },
+      { id: "e4", source: "gate", target: "o", branch: "done" },
+    ],
+  };
+}
+
+describe("the canvas adapter — a loop drawn back through a conditional", () => {
+  it("given_aLoopDocument_whenRoundTrippedThroughFlow_thenTheLoopBackEdgeSurvives", () => {
+    // Drawing the loop is drawing an edge from a branch handle to a node that is already
+    // upstream — nothing about the canvas has to know it closes a cycle, and nothing about
+    // the round trip may quietly straighten it out.
+    const original = loopDoc();
+    const flow = documentToFlow(original);
+
+    expect(flowToDocument(flow.nodes, flow.edges, original.workflow)).toEqual(original);
+  });
+
+  it("given_aLoopBackEdge_whenConverted_thenItLeavesItsBranchHandleAndCarriesItsLabel", () => {
+    const flow = documentToFlow(loopDoc());
+    const back = flow.edges.find((e) => e.id === "e3");
+
+    expect(back?.sourceHandle).toBe("again");
+    expect(back?.label).toBe("revise");
+    expect(back?.target).toBe("draft");
+  });
+
+  it("given_aLoopBackEdgeDrawnOnTheCanvas_whenSaved_thenItIsWrittenAsABranchEdge", () => {
+    // What the user draws is a connection out of a branch handle; that it lands on an
+    // earlier node is the loop. The branch has to survive, or the saved document holds a
+    // cycle with no gate on it — which `validateGraph` refuses.
+    const flow = documentToFlow(loopDoc());
+    const drawn = [
+      ...flow.edges.filter((e) => e.id !== "e3"),
+      { id: "e5", source: "gate", target: "i", sourceHandle: "again" },
+    ];
+
+    const saved = flowToDocument(flow.nodes, drawn, loopDoc().workflow);
+
+    expect(saved.edges.find((e) => e.id === "e5")).toEqual({
+      id: "e5",
+      source: "gate",
+      target: "i",
+      branch: "again",
+    });
+  });
+
+  it("given_aLoopBackEdge_whenTheCanvasLabelsItsInputs_thenItsTargetIsNotCalledAFanIn", () => {
+    // A loop-back replaces what the step it returns to works on; a fan-in concatenates.
+    // The canvas labels the second and never the first — a branch edge is an alternative
+    // or a loop, never an input, so the two labellers cannot land on one edge.
+    const flow = documentToFlow(loopDoc());
+
+    const labelled = withInputLabels(flow.nodes, flow.edges);
+
+    expect(labelled.find((e) => e.id === "e1")?.label).toBeUndefined();
+    expect(labelled.find((e) => e.id === "e3")?.label).toBe("revise");
+  });
+
+  it("given_aLoopBackEdge_whenTheGateIsStillPresent_thenTheEdgeIsKept", () => {
+    const flow = documentToFlow(loopDoc());
+
+    expect(keepConnectedEdges(flow.nodes, flow.edges).map((e) => e.id)).toEqual([
+      "e1",
+      "e2",
+      "e3",
+      "e4",
+    ]);
+  });
+});

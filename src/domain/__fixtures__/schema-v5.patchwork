@@ -1,0 +1,121 @@
+{
+  "schemaVersion": 5,
+  "workflow": {
+    "name": "Triage Report",
+    "description": "Triage a bug report along the path its contents call for."
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "type": "input",
+      "label": "Report",
+      "data": {
+        "parameters": [
+          {
+            "name": "report",
+            "description": "The raw bug report."
+          }
+        ]
+      },
+      "position": {
+        "x": 120,
+        "y": 120
+      }
+    },
+    {
+      "id": "c1",
+      "type": "conditional",
+      "label": "Has a stack trace?",
+      "data": {
+        "mode": "rule",
+        "question": "Does the report contain a stack trace?",
+        "branches": [
+          {
+            "id": "b1",
+            "label": "with trace"
+          },
+          {
+            "id": "b2",
+            "label": "no trace"
+          }
+        ],
+        "rule": {
+          "subject": "the number of stack frames in the report",
+          "operator": "greater-than",
+          "operand": "0",
+          "whenTrue": "b1",
+          "whenFalse": "b2"
+        }
+      },
+      "position": {
+        "x": 380,
+        "y": 120
+      }
+    },
+    {
+      "id": "n2",
+      "type": "prompt",
+      "label": "Extract frame",
+      "data": {
+        "instruction": "Name the failing frame in the stack trace."
+      },
+      "position": {
+        "x": 640,
+        "y": 40
+      }
+    },
+    {
+      "id": "n3",
+      "type": "prompt",
+      "label": "Ask reporter",
+      "data": {
+        "instruction": "List the reproduction details the reporter must add."
+      },
+      "position": {
+        "x": 640,
+        "y": 200
+      }
+    },
+    {
+      "id": "n4",
+      "type": "output",
+      "label": "Triage",
+      "data": {
+        "description": "The triage summary."
+      },
+      "position": {
+        "x": 900,
+        "y": 120
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "source": "n1",
+      "target": "c1"
+    },
+    {
+      "id": "e2",
+      "source": "c1",
+      "target": "n2",
+      "branch": "b1"
+    },
+    {
+      "id": "e3",
+      "source": "c1",
+      "target": "n3",
+      "branch": "b2"
+    },
+    {
+      "id": "e4",
+      "source": "n2",
+      "target": "n4"
+    },
+    {
+      "id": "e5",
+      "source": "n3",
+      "target": "n4"
+    }
+  ]
+}

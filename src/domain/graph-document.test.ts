@@ -17,6 +17,7 @@ import {
   MAX_WORKFLOW_NAME_LENGTH,
   type ArtifactRefData,
   type ConditionalData,
+  type GraphNode,
   type ConditionalRule,
   type InputData,
   type PatchworkDocument,
@@ -24,6 +25,7 @@ import {
   deserialize,
   exportModeOf,
   inputLabelOf,
+  loopGuardOf,
   serialize,
   slugify,
   validateGraph,
@@ -2285,6 +2287,237 @@ describe("validateGraph — labeled fan-in", () => {
       expect(validateGraph(doc)).toEqual({ ok: true });
     },
   );
+});
+
+/**
+ * A guarded loop: `Review` sends the draft round again, at most three times.
+ *
+ * ```
+ * Input -> Draft -> Review -- revise --> (back to Draft)
+ *                         \- ship   --> Output
+ * ```
+ */
+function loopDocument(): PatchworkDocument {
+  return {
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    workflow: { name: "Refine", description: "Refine a draft until it is good enough." },
+    nodes: [
+      {
+        id: "n1",
+        type: "input",
+        label: "Topic",
+        data: { parameters: [{ name: "topic", description: "The subject." }] },
+      },
+      {
+        id: "n2",
+        type: "prompt",
+        label: "Draft",
+        data: { instruction: "Draft a paragraph about {topic}." },
+      },
+      {
+        id: "c1",
+        type: "conditional",
+        label: "Good enough?",
+        data: {
+          mode: "llm",
+          question: "Does the draft still need work?",
+          maxIterations: 3,
+          branches: [
+            { id: "b1", label: "revise" },
+            { id: "b2", label: "ship" },
+          ],
+        },
+      },
+      {
+        id: "n3",
+        type: "output",
+        label: "Paragraph",
+        data: { description: "The finished paragraph." },
+      },
+    ],
+    edges: [
+      { id: "e1", source: "n1", target: "n2" },
+      { id: "e2", source: "n2", target: "c1" },
+      { id: "e3", source: "c1", target: "n2", branch: "b1" },
+      { id: "e4", source: "c1", target: "n3", branch: "b2" },
+    ],
+  };
+}
+
+describe("validateGraph — a cycle is refused unless a loop gate bounds it", () => {
+  it("given_aGuardedLoop_whenValidating_thenItIsExportable", () => {
+    // The whole of slice 6 in one assertion: a cyclic document is now a legal workflow,
+    // and it is legal *because* the conditional its loop passes through says how many
+    // passes the exported scaffold may allow.
+    expect(validateGraph(loopDocument())).toEqual({ ok: true });
+  });
+
+  it("given_aLoopGateWithNoGuard_whenValidating_thenItIsRefusedNamingTheGateAndTheEdge", () => {
+    const doc = loopDocument();
+    const gate = doc.nodes.find((n) => n.id === "c1") as GraphNode;
+    delete (gate.data as ConditionalData).maxIterations;
+
+    const errors = errorsOf(doc);
+
+    expect(errors).toContain(
+      "Conditional node 'c1' is a loop gate — edge e3 leads back to node 'n2' — but it has no max-iteration guard; give it a maximum number of passes between 1 and 999999999, which the exported control scaffold counts and stops the loop at",
+    );
+  });
+
+  it.each([
+    ["zero", 0],
+    ["negative", -1],
+    ["fractional", 2.5],
+    ["past what every shell compares alike", 1_000_000_000],
+  ])(
+    "given_aLoopGateGuardedBy_%s_whenValidating_thenItIsRefusedAsNoGuardAtAll",
+    (_case, guard) => {
+      // A guard out of range is not a smaller bound or a bigger one: it is a loop the
+      // scaffold cannot be made to stop, which is the same defect as no guard at all.
+      const doc = loopDocument();
+      const gate = doc.nodes.find((n) => n.id === "c1") as GraphNode;
+      (gate.data as ConditionalData).maxIterations = guard;
+
+      expect(
+        errorsOf(doc).some((e) =>
+          e.includes(`is guarded by '${guard}', which is not a number of passes`),
+        ),
+      ).toBe(true);
+    },
+  );
+
+  it("given_aCycleThroughNoConditional_whenValidating_thenItIsStillRefusedAsACycle", () => {
+    // A cycle with nothing to decide whether it runs again has nowhere to put a guard,
+    // so it stays the refusal it has always been — with an error that now says what the
+    // way out is.
+    const doc = loopDocument();
+    doc.nodes.push({
+      id: "n4",
+      type: "prompt",
+      label: "Rewrite",
+      data: { instruction: "Rewrite it." },
+    });
+    doc.edges = doc.edges.map((e) => (e.id === "e4" ? { ...e, target: "n4" } : e));
+    doc.edges.push({ id: "e5", source: "n4", target: "n2" });
+
+    expect(
+      errorsOf(doc).some((e) => /Graph contains a cycle through/.test(e)),
+    ).toBe(true);
+  });
+
+  it("given_aLoopGateWhoseEveryBranchLoopsBack_whenValidating_thenItIsRefusedForHavingNoWayOut", () => {
+    const doc = loopDocument();
+    doc.edges = doc.edges.map((e) => (e.id === "e4" ? { ...e, target: "n2" } : e));
+    doc.nodes = doc.nodes.filter((n) => n.id !== "n3");
+
+    expect(
+      errorsOf(doc).some((e) =>
+        e.includes(
+          "is a loop gate whose every branch leads back into the loop",
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it("given_aLoopGateOfferingThreeBranches_whenValidating_thenItIsRefusedForNotBeingATwoWayDecision", () => {
+    // The scaffold prints one label when the passes run out, so there has to be exactly
+    // one branch that is not the loop.
+    const doc = loopDocument();
+    const gate = doc.nodes.find((n) => n.id === "c1") as GraphNode;
+    (gate.data as ConditionalData).branches.push({ id: "b3", label: "escalate" });
+    doc.nodes.push({
+      id: "n4",
+      type: "prompt",
+      label: "Escalate",
+      data: { instruction: "Escalate." },
+    });
+    doc.edges.push({ id: "e5", source: "c1", target: "n4", branch: "b3" });
+    doc.edges.push({ id: "e6", source: "n4", target: "n3" });
+
+    expect(errorsOf(doc)).toContain(
+      "Conditional node 'c1' is a loop gate and offers 3 branches; a loop gate decides between going round again and leaving the loop, so it decides between exactly two",
+    );
+  });
+
+  it("given_aGuardedLoopWithAnAmbiguousFanIn_whenValidating_thenThePlanCheckStillRuns", () => {
+    // Every plan-derived check used to be skipped the moment a document held a cycle,
+    // because every node on one is "reached more than once". A loop is not that, so the
+    // checks run — and the fan-in check is the one that proves it, since it can only be
+    // asked of a graph that can be followed at all. It also shows the two arrivals being
+    // told apart: the two `Note` paths are inputs, the loop-back into the same node is not.
+    const doc = loopDocument();
+    doc.edges = doc.edges.filter((e) => e.id !== "e1");
+    for (const at of [1, 2]) {
+      doc.nodes.push({
+        id: `s${at}`,
+        type: "prompt",
+        label: "Note",
+        data: { instruction: `note ${at}` },
+      });
+      doc.edges.push({ id: `e1${at}`, source: "n1", target: `s${at}` });
+      doc.edges.push({ id: `e2${at}`, source: `s${at}`, target: "n2" });
+    }
+
+    expect(errorsOf(doc)).toContain(
+      "Node 'n2' has two incoming paths labelled 'Note'; label the edges or rename the nodes so the step can tell its inputs apart",
+    );
+  });
+
+  it("given_aGuardOnAConditionalThatDoesNotLoop_whenValidating_thenItIsIgnoredRatherThanRefused", () => {
+    // Kept, not validated, like a rule a node switched away from: rerouting an edge to
+    // look at the graph without its loop must not cost the user the bound they chose.
+    const doc = loopDocument();
+    doc.edges = doc.edges.map((e) => (e.id === "e3" ? { ...e, target: "n3" } : e));
+    doc.edges = doc.edges.filter((e) => e.id !== "e4");
+    (doc.nodes.find((n) => n.id === "c1")?.data as ConditionalData).branches = [
+      { id: "b1", label: "revise" },
+      { id: "b2", label: "ship" },
+    ];
+    doc.edges.push({ id: "e4", source: "c1", target: "n3", branch: "b2" });
+
+    expect(validateGraph(doc)).toEqual({ ok: true });
+  });
+
+  it("given_aGuardThatIsNotANumber_whenDeserializing_thenItIsRejectedAtTheLoadBoundary", () => {
+    const doc = loopDocument();
+    (doc.nodes.find((n) => n.id === "c1")?.data as Record<string, unknown>).maxIterations =
+      "3";
+
+    expect(() => deserialize(JSON.stringify(doc))).toThrow(
+      /numeric 'maxIterations' when present/,
+    );
+  });
+
+  it("given_aGuardedLoop_whenRoundTripped_thenTheGuardSurvives", () => {
+    const round = deserialize(serialize(loopDocument()));
+    const gate = round.nodes.find((n) => n.id === "c1");
+
+    expect(loopGuardOf(gate?.data as ConditionalData)).toBe(3);
+  });
+});
+
+describe("deserialize — forward migration to v6", () => {
+  it("given_schemaV5Fixture_whenDeserializing_thenItOpensUnchangedAtTheCurrentVersion", () => {
+    // v5 -> v6 only widened the vocabulary (a conditional's max-iteration guard), and no
+    // v5 document could contain a cycle at all, so a document from before loops opens
+    // exactly as it was.
+    const original = JSON.parse(readFixture("schema-v5.patchwork")) as PatchworkDocument;
+
+    const migrated = deserialize(readFixture("schema-v5.patchwork"));
+
+    expect(migrated.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+    expect(migrated.workflow).toEqual(original.workflow);
+    expect(migrated.nodes).toEqual(original.nodes);
+    expect(migrated.edges).toEqual(original.edges);
+    expect(validateGraph(migrated)).toEqual({ ok: true });
+  });
+
+  it("given_schemaV5Fixture_whenDeserializing_thenItsConditionalCarriesNoGuard", () => {
+    const migrated = deserialize(readFixture("schema-v5.patchwork"));
+    const conditional = migrated.nodes.find((n) => n.type === "conditional");
+
+    expect(loopGuardOf(conditional?.data as ConditionalData)).toBeUndefined();
+  });
 });
 
 describe("deserialize — forward migration to v5", () => {

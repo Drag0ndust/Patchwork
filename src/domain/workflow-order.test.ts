@@ -6,6 +6,7 @@ import {
   type PatchworkDocument,
 } from "./graph-document";
 import {
+  loopBacks,
   nestingDepth,
   plannedNodes,
   planWorkflow,
@@ -562,6 +563,221 @@ describe("planWorkflow — the rule holds on a document with a cycle too", () =>
 });
 
 /**
+ * A guarded loop: `review` decides whether the draft goes round again, and its `again`
+ * branch loops back to `draft`.
+ *
+ * ```
+ * i -> draft -> review -- again --> (back to draft)
+ *                      \- done  --> polish -> o
+ * ```
+ */
+function loopDocument(): PatchworkDocument {
+  return {
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    workflow: { name: "Loop", description: "d" },
+    nodes: [
+      { id: "i", type: "input", label: "In", data: { parameters: [{ name: "x" }] } },
+      { id: "draft", type: "prompt", label: "Draft", data: { instruction: "draft" } },
+      {
+        id: "review",
+        type: "conditional",
+        label: "Good enough?",
+        data: {
+          mode: "llm",
+          question: "Is the draft good enough?",
+          maxIterations: 3,
+          branches: [
+            { id: "again", label: "revise" },
+            { id: "done", label: "good enough" },
+          ],
+        },
+      },
+      { id: "polish", type: "prompt", label: "Polish", data: { instruction: "polish" } },
+      { id: "o", type: "output", label: "Out", data: { description: "r" } },
+    ],
+    edges: [
+      { id: "e1", source: "i", target: "draft" },
+      { id: "e2", source: "draft", target: "review" },
+      { id: "e3", source: "review", target: "draft", branch: "again" },
+      { id: "e4", source: "review", target: "polish", branch: "done" },
+      { id: "e5", source: "polish", target: "o" },
+    ],
+  };
+}
+
+/**
+ * One cycle, two gates, and a branch of each on it — the shape the tie-break is about.
+ *
+ * ```
+ * i -> a(cond) -- x --> b(cond) -- y --> (back to a)
+ *        \- z -> o        \- w -> o
+ * ```
+ */
+function twoGateCycleDocument(): PatchworkDocument {
+  const gate = (id: string, first: string, second: string) => ({
+    id,
+    type: "conditional" as const,
+    label: "Again?",
+    data: {
+      mode: "llm",
+      question: "Again?",
+      maxIterations: 3,
+      branches: [
+        { id: first, label: first },
+        { id: second, label: second },
+      ],
+    },
+  });
+  return {
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    workflow: { name: "Two gates", description: "d" },
+    nodes: [
+      { id: "i", type: "input", label: "In", data: { parameters: [{ name: "x" }] } },
+      gate("a", "x", "z"),
+      gate("b", "y", "w"),
+      { id: "o", type: "output", label: "Out", data: { description: "r" } },
+    ],
+    edges: [
+      { id: "e1", source: "i", target: "a" },
+      { id: "e2", source: "a", target: "b", branch: "x" },
+      { id: "e3", source: "b", target: "a", branch: "y" },
+      { id: "e4", source: "a", target: "o", branch: "z" },
+      { id: "e5", source: "b", target: "o", branch: "w" },
+    ],
+  };
+}
+
+describe("loopBacks — which edge closes a cycle, and through which gate", () => {
+  it("given_aBranchThatLoopsBackToAnEarlierStep_whenAsked_thenThatEdgeIsTheLoopBack", () => {
+    const loops = loopBacks(loopDocument());
+
+    expect([...loops.keys()]).toEqual(["e3"]);
+    expect(loops.get("e3")?.gate.id).toBe("review");
+    expect(loops.get("e3")?.target.id).toBe("draft");
+  });
+
+  it("given_anAcyclicDocument_whenAsked_thenNoEdgeLoopsBack", () => {
+    expect(loopBacks(branchingDocument()).size).toBe(0);
+    expect(loopBacks(fanInDocument()).size).toBe(0);
+  });
+
+  it("given_aCycleThatPassesThroughNoConditional_whenAsked_thenNothingLoopsBack", () => {
+    // A cycle with nothing to decide whether it runs again is not a loop — it is the
+    // cycle `validateGraph` refuses. Only a gate's branch closes a loop.
+    const doc = loopDocument();
+    doc.edges = doc.edges.map((e) => (e.id === "e5" ? { ...e, target: "draft" } : e));
+
+    expect(loopBacks(doc).has("e5")).toBe(false);
+  });
+
+  it("given_aBranchThatJumpsForwardPastSteps_whenAsked_thenItIsNotALoopBack", () => {
+    // Leaving a conditional is not looping: the question is whether the edge's target can
+    // reach the gate again, never which way it points on the canvas.
+    const doc = loopDocument();
+    doc.edges = doc.edges.map((e) => (e.id === "e3" ? { ...e, target: "polish" } : e));
+
+    expect(loopBacks(doc).size).toBe(0);
+  });
+
+  it("given_aCycleTwoGateBranchesCouldEachClose_whenAsked_thenTheOneTheSearchMeetsClosesIt", () => {
+    // The documented tie-break, pinned directly. Both `a -> b` and `b -> a` are a gate's
+    // branch and both sit on the one cycle, so either could be read as the edge that closes
+    // it — and it matters which, because the edge that closes a loop is dropped from the
+    // walk and its gate is the one that has to carry a guard. The rule is the same "first
+    // edge wins" the walk applies everywhere: the search meets `b -> a` with `a` still on
+    // the path, and that is the loop-back. Asked twice of the same document, it answers the
+    // same, because nothing here is iteration order.
+    const loops = loopBacks(twoGateCycleDocument());
+
+    expect([...loops.keys()]).toEqual(["e3"]);
+    expect([...loopBacks(twoGateCycleDocument()).keys()]).toEqual(["e3"]);
+    expect(loops.get("e3")?.gate.id).toBe("b");
+    expect(loops.get("e3")?.target.id).toBe("a");
+  });
+
+  it("given_theSameCycleEnteredAtTheOtherGate_whenAsked_thenTheOtherBranchClosesIt", () => {
+    // Which edge closes the cycle is a fact about the *document* rather than about
+    // iteration order, and the document is what the entry edge makes it: entering the same
+    // two gates at `b` instead of `a` is the search meeting `a -> b` with its own start
+    // still on the path, so that is the loop-back and `a` is the gate that carries the
+    // guard. Both documents export; they are two different workflows, not one workflow
+    // classified two ways.
+    const doc = twoGateCycleDocument();
+    doc.edges = doc.edges.map((e) => (e.id === "e1" ? { ...e, target: "b" } : e));
+
+    expect([...loopBacks(doc).keys()]).toEqual(["e2"]);
+    expect(loopBacks(doc).get("e2")?.gate.id).toBe("a");
+    expect(validateGraph(doc)).toEqual({ ok: true });
+    expect(validateGraph(twoGateCycleDocument())).toEqual({ ok: true });
+  });
+
+  it("given_aGateThatLoopsBackToItself_whenAsked_thenItIsStillALoopBack", () => {
+    const doc = loopDocument();
+    doc.edges = doc.edges.map((e) => (e.id === "e3" ? { ...e, target: "review" } : e));
+
+    expect(loopBacks(doc).get("e3")?.target.id).toBe("review");
+  });
+});
+
+describe("planWorkflow — a loop is planned once, and the gate carries the way back", () => {
+  it("given_aGuardedLoop_whenPlanned_thenTheLoopBodyIsPlannedOnceAndNothingIsAProblem", () => {
+    // The steps between the gate's target and the gate are the loop body; they are the
+    // steps already planned, so planning them again is exactly the "reached more than
+    // once" defect a loop must not read as.
+    const plan = planWorkflow(loopDocument());
+
+    expect(outline(plan.segments)).toBe("i -> draft -> review(again:  | done: ) -> polish -> o");
+    expect(plan.problems).toEqual([]);
+    expect(plannedNodes(plan)).toHaveLength(5);
+  });
+
+  it("given_aGuardedLoop_whenPlanned_thenTheLoopingBranchNamesWhereTheNextPassStarts", () => {
+    const segment = planWorkflow(loopDocument()).segments[2];
+    if (segment.kind !== "branch") throw new Error("the gate is a branch segment");
+
+    expect(segment.branches[0].loopBackTo?.id).toBe("draft");
+    expect(segment.branches[1].loopBackTo).toBeUndefined();
+  });
+
+  it("given_aCycleThatNoGateBreaks_whenPlanned_thenTheRepeatedNodeIsStillReported", () => {
+    const doc = loopDocument();
+    doc.edges = doc.edges.map((e) => (e.id === "e5" ? { ...e, target: "draft" } : e));
+
+    expect(
+      planWorkflow(doc).problems.some((p) => p.includes("reached more than once")),
+    ).toBe(true);
+  });
+
+  it("given_aLoopWhoseBodyIsABranch_whenPlanned_thenTheBodyKeepsItsOwnShape", () => {
+    // The loop-back leaves the walk alone apart from not being walked: what is inside the
+    // loop is planned exactly as it would be without it.
+    const doc = loopDocument();
+    doc.nodes.push({
+      id: "c",
+      type: "conditional",
+      label: "Which?",
+      data: {
+        mode: "llm",
+        question: "Which?",
+        branches: [
+          { id: "a", label: "a" },
+          { id: "b", label: "b" },
+        ],
+      },
+    });
+    doc.nodes.push({ id: "A", type: "prompt", label: "A", data: { instruction: "a" } });
+    doc.edges = doc.edges.map((e) => (e.id === "e2" ? { ...e, target: "c" } : e));
+    doc.edges.push({ id: "e6", source: "c", target: "A", branch: "a" });
+    doc.edges.push({ id: "e7", source: "c", target: "review", branch: "b" });
+    doc.edges.push({ id: "e8", source: "A", target: "review" });
+
+    expect(outline(planWorkflow(doc).segments)).toBe(
+      "i -> draft -> c(a: A | b: ) -> review(again:  | done: ) -> polish -> o",
+    );
+  });
+});
+
+/**
  * A tiny reference implementation of the plan, written the way the rule reads rather than
  * the way it performs: reachability by sweeping, convergence by intersecting the heads'
  * reachable sets and taking the topologically earliest, and the walk by plain recursion.
@@ -573,12 +789,43 @@ describe("planWorkflow — the rule holds on a document with a cycle too", () =>
  */
 function referencePlan(doc: PatchworkDocument): { outline: string; problems: number } {
   const byId = new Map(doc.nodes.map((n) => [n.id, n]));
-  const outgoing = new Map<string, Array<{ target: string; branch?: string }>>();
+  const drawn = new Map<string, Array<{ id: string; target: string; branch?: string }>>();
   for (const edge of doc.edges) {
     if (!byId.has(edge.source) || !byId.has(edge.target)) continue;
-    const list = outgoing.get(edge.source) ?? [];
-    list.push({ target: edge.target, branch: edge.branch });
-    outgoing.set(edge.source, list);
+    const list = drawn.get(edge.source) ?? [];
+    list.push({ id: edge.id, target: edge.target, branch: edge.branch });
+    drawn.set(edge.source, list);
+  }
+
+  // A loop-back is a branch of a conditional that arrives at a node the depth-first walk is
+  // currently inside, and it is not walked: going round again re-runs steps the plan already
+  // holds. Recursion and a set, which is the rule as it reads.
+  const loops = new Set<string>();
+  const onPath = new Set<string>();
+  const classified = new Set<string>();
+  const classify = (id: string): void => {
+    classified.add(id);
+    onPath.add(id);
+    for (const edge of drawn.get(id) ?? []) {
+      if (onPath.has(edge.target)) {
+        if (byId.get(id)?.type === "conditional" && edge.branch !== undefined) {
+          loops.add(edge.id);
+        }
+        continue;
+      }
+      if (!classified.has(edge.target)) classify(edge.target);
+    }
+    onPath.delete(id);
+  };
+  const entry = doc.nodes.find((n) => n.type === "input");
+  for (const node of entry === undefined ? doc.nodes : [entry, ...doc.nodes]) {
+    if (!classified.has(node.id)) classify(node.id);
+  }
+
+  const outgoing = new Map<string, Array<{ target: string; branch?: string }>>();
+  for (const [source, edges] of drawn) {
+    const kept = edges.filter((edge) => !loops.has(edge.id));
+    if (kept.length > 0) outgoing.set(source, kept);
   }
 
   const reachable = (start: string): Set<string> => {
