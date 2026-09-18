@@ -418,11 +418,15 @@ export function App() {
       // exactly the artifacts that were just checked — a scan landing while the
       // directory picker is open must not change what gets copied.
       const artifacts = catalogRef.current.artifacts.map((a) => a.artifact);
+      // Everything the bundle would have to *carry* and cannot: an artifact a node
+      // asked to copy and that is not there, and one authored here whose name the
+      // bundle could not give a file. Both are refusals about bytes, so both are
+      // checked here rather than in `validateGraph`, which never sees the catalog.
       const unvendorable = vendorErrors(doc, artifacts);
       if (unvendorable.length > 0) {
         setErrors(unvendorable);
         setStatus(
-          "Cannot export: a node is set to copy an artifact that is not available right now.",
+          "Cannot export: a node's artifact cannot be written into the bundle.",
         );
         return;
       }
@@ -550,7 +554,15 @@ export function App() {
         </ul>
       )}
 
-      <NodeEditor node={selectedNode} catalog={catalog} onChange={updateNode} />
+      {/* The whole node list, for the one dock question that is about the *graph*:
+          whether an artifact authored here collides with one authored elsewhere. */}
+      <NodeEditor
+        node={selectedNode}
+        nodes={nodes}
+        catalog={catalog}
+        workflowName={workflowName}
+        onChange={updateNode}
+      />
 
       {status && <footer className="pw-status">{status}</footer>}
     </div>

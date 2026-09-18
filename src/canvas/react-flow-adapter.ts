@@ -1,5 +1,6 @@
 import type { Edge, Node } from "@xyflow/react";
 import {
+  authoredArtifactOf,
   branchesWithinLimit,
   CURRENT_SCHEMA_VERSION,
   MAX_BRANCHES_PER_CONDITIONAL,
@@ -9,6 +10,7 @@ import {
   type Branch,
   type ConditionalData,
   type GraphEdge,
+  type GraphNode,
   type NodeData,
   type NodeType,
   type PatchworkDocument,
@@ -303,6 +305,14 @@ export function applyResolution(
     // where the artifact came from when the document was saved, but precedence
     // re-runs against the roots configured *now*, so the winning root may
     // legitimately differ. Matching on rootId would defeat that contract.
+    // An authored artifact lives in the document, so there is nothing in a source
+    // root for it to resolve to — and flagging it would claim a dependency the node
+    // does not have. Read through `authoredArtifactOf`, never by testing for a field.
+    if (authoredArtifactOf(toGraphNode(node)) !== undefined) {
+      if (node.data.unresolved === false) return node;
+      changed = true;
+      return { ...node, data: { ...node.data, unresolved: false } };
+    }
     const { name } = node.data.node as ArtifactRefData;
     // An unbound node references nothing yet, so it cannot be *un*resolved — the
     // node body already says "no artifact bound". Flagging it here would also add
@@ -315,6 +325,23 @@ export function applyResolution(
   });
   // Identity-stable when nothing moved, so React/React Flow can skip the update.
   return changed ? resolved : (nodes as PatchNode[]);
+}
+
+/**
+ * The document node a canvas node stands for — the shape every domain rule is
+ * written against.
+ *
+ * Only the four fields those rules read, and no position: this is asked per node on
+ * every resolution pass, and it exists so the canvas can ask a domain question
+ * without the domain learning what a React Flow node is.
+ */
+export function toGraphNode(node: PatchNode): GraphNode {
+  return {
+    id: node.id,
+    type: node.type as NodeType,
+    label: node.data.label,
+    data: node.data.node,
+  };
 }
 
 /** Rebuild a Patchwork document from the current canvas state. */

@@ -28,6 +28,13 @@
  * what the script decides is guaranteed, what this prose says is best-effort. Nothing
  * changes for a workflow that has no rule to evaluate, down to the byte (ADR-0004).
  *
+ * Slice 8 adds authoring: a `skill`/`agent` node's artifact can be written in the
+ * graph rather than imported, and then the bundle is the only place it exists. It is
+ * materialized exactly as a vendored copy is — the codec composes it from the node's
+ * fields, and from there it is the same name, the same path and the same namespace —
+ * because once the bytes are in the bundle, Claude Code cannot tell the two apart.
+ * Only the umbrella can, and it says where each one came from (ADR-0007).
+ *
  * Slice 7 adds labelled fan-in: where several paths lead into one step, the umbrella
  * names what arrives and says it is concatenated under those labels rather than merged.
  * Which edges those are is a question about the *plan* rather than about the graph, and
@@ -35,19 +42,25 @@
  * [`fanInIndex`] and ADR-0005.
  */
 
-import { stringify as stringifyYaml } from "yaml";
 import {
   artifactRelativePath,
+  composeArtifact,
   emitArtifact,
   isValidArtifactName,
+  isValidAuthoredArtifactName,
   parseArtifactLocation,
+  stringifyFrontmatter,
+  stripTrailingNewlines,
   type Artifact,
   type ArtifactKind,
 } from "./artifact-codec";
 import {
   artifactKindOf,
+  asText,
+  authoredArtifactName,
+  authoredArtifactOf,
   branchesOf,
-  BUNDLE_DIR_PREFIX,
+  bundleDirNameFor,
   comparedOperand,
   conditionalModeOf,
   exportModeOf,
@@ -56,6 +69,7 @@ import {
 } from "./graph-document";
 import type {
   ArtifactRefData,
+  AuthoredArtifactData,
   Branch,
   ConditionalData,
   ConditionalRule,
@@ -218,32 +232,59 @@ function sanitizeInline(value: string | undefined): string {
   return collapsed;
 }
 
-/**
- * Drop the trailing newline(s) a YAML emitter ends its document with.
- *
- * A loop rather than `/\n+$/`, for the same reason as [`collapseLineBreakRuns`]:
- * anchoring a greedy run at the end of the string makes the engine match a run of
- * newlines *anywhere* and then backtrack the whole way once `$` fails, which is
- * quadratic in the newlines the emitted block scalar contains. A description with
- * 200,000 of them took 57 seconds to strip one character — on the renderer's main
- * thread. `trimEnd` is not a substitute: it would also eat trailing spaces and tabs,
- * which are part of the emitted YAML.
- */
-function stripTrailingNewlines(text: string): string {
-  let end = text.length;
-  while (end > 0 && text[end - 1] === "\n") end -= 1;
-  return text.slice(0, end);
-}
-
 /** The identity of an artifact reference: its kind and the name it was bound to. */
 function artifactKey(kind: ArtifactKind, name: string): string {
   return `${kind} ${name}`;
 }
 
-/** One vendored artifact: where its bytes land, and what it is called there. */
+/**
+ * The identity of what a `skill`/`agent` node contributes to the bundle.
+ *
+ * Authored artifacts are keyed **apart from** imported ones even when they share a
+ * name, because they are not the same artifact: one is the user's file, the other is
+ * prose in this document, and collapsing them would let a reference to an installed
+ * `triage` silently stand in for a `triage` written here. Two authored nodes claiming
+ * one name *do* collapse — they would land on one path, and `validateGraph` is what
+ * asks the user which one they meant.
+ */
+function nodeArtifactKey(node: GraphNode, kind: ArtifactKind): string {
+  return authoredArtifactOf(node) === undefined
+    ? artifactKey(kind, (node.data as ArtifactRefData | undefined)?.name ?? "")
+    : `authored ${artifactKey(kind, authoredArtifactName(node))}`;
+}
+
+/**
+ * What a `skill`/`agent` node's artifact is called *outside* the bundle: the name it
+ * has in a source root, or — for an authored one — the name it was given here.
+ *
+ * Read as possibly-absent, like every other read of node data in this module: the
+ * umbrella emitter is the boundary against a hand-edited document (issue #27).
+ */
+function artifactNameOfNode(node: GraphNode): string {
+  const authored = authoredArtifactOf(node);
+  return authored === undefined
+    ? ((node.data as ArtifactRefData | undefined)?.name ?? "")
+    : authoredArtifactName(node);
+}
+
+/**
+ * How an artifact came to be in the bundle.
+ *
+ * The bundle treats the two identically — the bytes are here, the name is the
+ * bundle's, nothing has to be installed — and the *only* thing that differs is what
+ * the umbrella can truthfully say about where it came from: a copy has an original
+ * somewhere, an authored artifact has none (ADR-0007).
+ */
+type CopyOrigin = "imported" | "authored";
+
+/** One artifact the bundle carries: where its bytes land, and what it is called there. */
 interface VendoredCopy {
   kind: ArtifactKind;
-  /** The name it has in the user's source roots, for prose about its origin. */
+  origin: CopyOrigin;
+  /**
+   * The name it has where it came from — a source root, or (for an authored one)
+   * this document. Used only for prose about its origin.
+   */
   sourceName: string;
   /**
    * The **bare** name it has inside the bundle. A vendored artifact loses its
@@ -331,6 +372,34 @@ function chooseBundleName(
 }
 
 /**
+ * Every bare name the authored artifacts in this chain will be written under.
+ *
+ * Collected **before** anything is placed, because an authored name is not negotiable
+ * and a vendored copy's is: the copy's leaf is a convenience the bundle chose for it
+ * (ADR-0002), while the authored one is both the path and the `name:` the emitted file
+ * declares. Deciding in chain order instead let an import that happened to come first
+ * take the name, silently renaming the artifact its author had named — and the
+ * author's name then depended on where an unrelated node sat in the chain.
+ *
+ * Only *usable* names are claimed: an authored name the validator refuses would
+ * otherwise push a copy off a name for the sake of an artifact that is never written.
+ */
+function authoredNameClaims(ordered: GraphNode[]): Map<string, GraphNode> {
+  const claims = new Map<string, GraphNode>();
+  for (const node of ordered) {
+    const kind = artifactKindOf(node.type);
+    if (!kind || authoredArtifactOf(node) === undefined) continue;
+    const name = authoredArtifactName(node);
+    const claim = bundleNameClaim(kind, name);
+    // The *node* and not just the name, so that a copy refused because an authored
+    // artifact took the name it wanted can say whose name it is: sending the user to
+    // re-pick an import whose own name is fine is advice they cannot act on.
+    if (isValidAuthoredArtifactName(name) && !claims.has(claim)) claims.set(claim, node);
+  }
+  return claims;
+}
+
+/**
  * The node that asked for each artifact to be copied, keyed by [`artifactKey`].
  *
  * The export mode is a property of the *artifact* in the bundle, not of the node:
@@ -349,9 +418,14 @@ function vendorRequests(ordered: GraphNode[]): Map<string, GraphNode> {
   for (const node of ordered) {
     const kind = artifactKindOf(node.type);
     if (!kind) continue;
-    const ref = node.data as ArtifactRefData;
+    // Authored nodes are not requests: they are carried unconditionally, and they have
+    // no export mode to state. Absent data is skipped rather than read (issue #27).
+    const ref = node.data as ArtifactRefData | undefined;
+    // Absent, null, or not an object at all is skipped rather than read (issue #27).
+    if (typeof ref !== "object" || ref === null) continue;
+    if (authoredArtifactOf(node) !== undefined) continue;
     if (exportModeOf(ref) !== "vendor") continue;
-    const key = artifactKey(kind, ref.name);
+    const key = artifactKey(kind, ref.name ?? "");
     if (!requests.has(key)) requests.set(key, node);
   }
   return requests;
@@ -379,21 +453,72 @@ function attemptCopy(
   name: string,
   artifact: Artifact | undefined,
   taken: Set<string>,
+  origin: CopyOrigin,
+  authoredClaimants: ReadonlyMap<string, GraphNode> = new Map(),
 ): CopyAttempt {
-  const prefix = `${nodeLabel(kind)} node '${requestedBy.id}' is set to copy '${name}' into the bundle, but`;
+  const authored = origin === "authored";
+  const prefix = authored
+    ? `${nodeLabel(kind)} node '${requestedBy.id}' authors '${name}', but`
+    : `${nodeLabel(kind)} node '${requestedBy.id}' is set to copy '${name}' into the bundle, but`;
+  // The node whose authored name this copy would have wanted, if there is one. An
+  // authored claim is honoured ahead of every copy, so it is what pushes a copy down
+  // the leaf-then-suffix ladder — and a copy refused at the bottom of that ladder used
+  // to blame the import, whose own name is fine and which cannot fix anything. Only
+  // the authored node can give the name back, so the message has to name it.
+  const displacedBy = authored
+    ? undefined
+    : authoredClaimants.get(bundleNameClaim(kind, name.split(":").pop() as string));
+  // The way out differs with the origin, and it is the only actionable half of the
+  // message: an imported artifact is re-picked or referenced instead, while an
+  // authored one has nowhere else to come from — it is renamed where it was written.
+  const fix = authored
+    ? "rename it in the dock"
+    : displacedBy
+      ? `${nodeLabel(kind)} node '${displacedBy.id}' authors '${authoredArtifactName(displacedBy)}' here and an authored name is never renamed around, so rename that one or switch node '${requestedBy.id}' to reference-by-name`
+      : "re-pick the artifact or switch the node to reference-by-name";
   if (!artifact) {
     return {
       problem: `${prefix} that artifact is not in any configured source root right now — restore the root, re-pick the artifact, or switch the node to reference-by-name`,
     };
   }
 
+  // **Who chooses the name** is the whole difference between the two origins.
+  //
+  // A copy's bare name is one the bundle picks for it: the source namespace does not
+  // exist in here, so `coding:tdd` becomes whatever is free (ADR-0002), and the copy's
+  // own frontmatter is left untouched because those are the user's bytes. An authored
+  // artifact is the other way round — Patchwork writes both the path and the `name:`
+  // inside the file, so the author's name is used **verbatim** or not at all. Letting
+  // it fall through the leaf-then-suffix ladder emitted `skills/tdd-2/SKILL.md`
+  // declaring `name: tdd`, a file this repo's own Import Scanner flags as a
+  // declared-name conflict.
+  //
+  // So this is an invariant a refactor has to keep: for an authored artifact the
+  // bundle name and the `name:` inside the file are the *same* value, because the
+  // caller passes `authoredArtifactName(node)` here and `composedArtifact` writes the
+  // file from the same node. They cannot disagree, and nothing downstream checks that
+  // they agree.
+  const bundleName = authored ? name : chooseBundleName(kind, artifact.name, taken);
   // Self-checking rather than trusting provenance: `bundleName` becomes a path
   // component and an inline code span, and a caller could hand us an artifact
-  // that never went through the codec's name validation.
-  const bundleName = chooseBundleName(kind, artifact.name, taken);
-  if (!isValidArtifactName(bundleName)) {
+  // that never went through the codec's name validation. An authored one is held to
+  // the stricter rule it was validated against, so `compile` cannot write a path the
+  // validator would have refused.
+  const nameIsUsable = authored
+    ? isValidAuthoredArtifactName(bundleName)
+    : isValidArtifactName(bundleName);
+  if (!nameIsUsable) {
     return {
-      problem: `${prefix} '${bundleName}' is not a name a copy can be given inside the bundle — re-pick the artifact or switch the node to reference-by-name`,
+      problem: `${prefix} '${bundleName}' is not a name a copy can be given inside the bundle — ${fix}`,
+    };
+  }
+  if (taken.has(bundleNameClaim(kind, bundleName))) {
+    // Only reachable for an authored artifact — `chooseBundleName` never returns a
+    // taken name — and only when two of them claim one name, which `validateGraph`
+    // refuses in the words of both nodes. Refused rather than renamed, so that no
+    // emitted file is ever called something other than what it says it is called.
+    return {
+      problem: `${prefix} something else in this bundle is already called '${bundleName}' — ${fix}`,
     };
   }
 
@@ -406,7 +531,7 @@ function attemptCopy(
   const located = parseArtifactLocation(path);
   if (located?.kind !== kind || located.name !== bundleName) {
     return {
-      problem: `${prefix} a copy at '${path}' would not be discoverable as '${bundleName}' — re-pick the artifact or switch the node to reference-by-name`,
+      problem: `${prefix} a copy at '${path}' would not be discoverable as '${bundleName}' — ${fix}`,
     };
   }
 
@@ -417,19 +542,45 @@ function attemptCopy(
   const invocation = `${dirName}:${bundleName}`;
   if (!isValidArtifactName(invocation)) {
     return {
-      problem: `${prefix} inside the bundle it would be invoked as '${invocation}', which is not a name Claude Code can resolve — shorten the workflow name, pick an artifact with a shorter name, or switch the node to reference-by-name`,
+      problem: authored
+        ? `${prefix} inside the bundle it would be invoked as '${invocation}', which is not a name Claude Code can resolve — shorten the workflow name, or give the artifact a shorter name`
+        : `${prefix} inside the bundle it would be invoked as '${invocation}', which is not a name Claude Code can resolve — shorten the workflow name, pick an artifact with a shorter name, or switch the node to reference-by-name`,
     };
   }
 
   return {
     copy: {
       kind,
+      origin,
       sourceName: artifact.name,
       bundleName,
       path,
       contents: emitArtifact(artifact),
     },
   };
+}
+
+/**
+ * The artifact an authored node describes, built through the codec's own composer so
+ * that authored and imported artifacts leave this module by one emit path.
+ *
+ * Total: a half-finished authored node composes into a half-finished artifact, which
+ * `validateGraph` refuses in the words of the node — `compile` never throws (#27).
+ */
+function composedArtifact(
+  kind: ArtifactKind,
+  node: GraphNode,
+  authored: AuthoredArtifactData,
+): Artifact {
+  return composeArtifact({
+    kind,
+    name: authoredArtifactName(node),
+    description: authored.description ?? "",
+    tools: authored.tools,
+    model: authored.model,
+    effort: authored.effort,
+    body: authored.body ?? "",
+  });
 }
 
 /**
@@ -458,27 +609,70 @@ function planBundle(
   };
   const seen = new Set<string>();
   const takenBundleNames = new Set<string>();
+  /** Which authored node claims each name — fixed before anything is placed. */
+  const authoredClaimants = authoredNameClaims(ordered);
+  // The same set as `takenBundleNames` plus every authored name, kept in step with it
+  // rather than rebuilt for each request: the authored claims never change.
+  const takenOrAuthored = new Set(authoredClaimants.keys());
+
+  /** A name a copy has just taken, recorded in both views of what is taken. */
+  const claim = (kind: ArtifactKind, bundleName: string) => {
+    takenBundleNames.add(bundleNameClaim(kind, bundleName));
+    takenOrAuthored.add(bundleNameClaim(kind, bundleName));
+  };
 
   for (const node of ordered) {
     const kind = artifactKindOf(node.type);
     if (!kind) continue;
-    const ref = node.data as ArtifactRefData;
-    const key = artifactKey(kind, ref.name);
+    const key = nodeArtifactKey(node, kind);
     if (seen.has(key)) continue;
     seen.add(key);
 
+    // An authored artifact is *always* carried: there is no original anywhere to
+    // reference instead, so "reference by name" is not one of its options (ADR-0007).
+    // It is otherwise bundled exactly as a copy is — same name choice, same path
+    // check, same namespace — because once the bytes are in the bundle the two are
+    // the same thing to Claude Code.
+    const authored = authoredArtifactOf(node);
+    if (authored !== undefined) {
+      const attempt = attemptCopy(
+        dirName,
+        node,
+        kind,
+        authoredArtifactName(node),
+        composedArtifact(kind, node, authored),
+        takenBundleNames,
+        "authored",
+      );
+      if ("copy" in attempt) {
+        claim(kind, attempt.copy.bundleName);
+        plan.vendored.set(key, attempt.copy);
+        continue;
+      }
+      // Not materialized, for whatever reason: the umbrella still names the step, so
+      // a refused export is never a silently shorter workflow.
+      plan.problems.push(attempt.problem);
+      plan.references.push(node);
+      continue;
+    }
+
+    const ref = node.data as ArtifactRefData | undefined;
     const requestedBy = requests.get(key);
     if (requestedBy) {
       const attempt = attemptCopy(
         dirName,
         requestedBy,
         kind,
-        ref.name,
+        typeof ref?.name === "string" ? ref.name : "",
         available.get(key),
-        takenBundleNames,
+        // Every authored name is off the table before a single copy is placed, so a
+        // copy is renamed around an authored artifact and never the other way round.
+        takenOrAuthored,
+        "imported",
+        authoredClaimants,
       );
       if ("copy" in attempt) {
-        takenBundleNames.add(bundleNameClaim(kind, attempt.copy.bundleName));
+        claim(kind, attempt.copy.bundleName);
         plan.vendored.set(key, attempt.copy);
         continue;
       }
@@ -562,9 +756,10 @@ function ownInstruction(node: GraphNode, plan: BundlePlan): string {
   if (!kind) {
     return sanitizeInline((node.data as PromptData | undefined)?.instruction);
   }
-  const ref = node.data as ArtifactRefData;
-  const copy = plan.vendored.get(artifactKey(kind, ref.name));
-  const name = artifactSpanText(copy ? invocationName(plan, copy) : ref.name);
+  const copy = plan.vendored.get(nodeArtifactKey(node, kind));
+  const name = artifactSpanText(
+    copy ? invocationName(plan, copy) : artifactNameOfNode(node),
+  );
   const where = copy
     ? ` — it is bundled here at \`${codeSpanText(copy.path)}\`, so read that file if the name does not resolve — `
     : ", ";
@@ -1015,7 +1210,7 @@ function artifactNoun(kind: ArtifactKind): string {
 
 /** The bundle directory a document compiles into. */
 function bundleDirName(doc: PatchworkDocument): string {
-  return `${BUNDLE_DIR_PREFIX}${slugify(doc.workflow.name ?? "")}`;
+  return bundleDirNameFor(doc.workflow.name ?? "");
 }
 
 /**
@@ -1059,11 +1254,13 @@ function renderSkill(
 
   const lines: string[] = [];
 
-  // Serialize frontmatter through a real YAML emitter so descriptions with
-  // colons, leading indicators, quotes, or newlines stay valid YAML.
-  // `lineWidth: 0` disables line folding so long scalars are not wrapped.
+  // Serialized through the codec's own emitter, the one an authored artifact's
+  // frontmatter goes through: descriptions with colons, leading indicators, quotes or
+  // newlines stay valid YAML, and a description of `yes` or `1:30` stays *text* to the
+  // YAML 1.1 readers this ecosystem is full of. The umbrella is read by the same tools
+  // the artifacts beside it are, so it cannot be emitted by a laxer rule.
   const frontmatter = stripTrailingNewlines(
-    stringifyYaml({ name: slug, description }, { lineWidth: 0 }),
+    stringifyFrontmatter({ name: slug, description: asText(description) }),
   );
   // Appended one line at a time, NOT spread into `push`: a description with many
   // newlines becomes a block scalar of as many lines, and `push(...lines)` passes
@@ -1136,7 +1333,7 @@ function renderSkill(
     lines.push("");
     for (const node of plan.references) {
       const kind = artifactKindOf(node.type) as ArtifactKind;
-      const name = artifactSpanText((node.data as ArtifactRefData).name);
+      const name = artifactSpanText(artifactNameOfNode(node));
       lines.push(`- ${artifactNoun(kind)} \`${name}\``);
     }
     lines.push("");
@@ -1145,15 +1342,29 @@ function renderSkill(
   // Kept apart from Requirements on purpose: what ships with the bundle and what
   // has to be installed alongside it are different obligations for the reader.
   if (plan.vendored.size > 0) {
+    const anyAuthored = [...plan.vendored.values()].some(
+      (copy) => copy.origin === "authored",
+    );
     lines.push("## Bundled capabilities");
     lines.push("");
+    // Two sentences, because a bundle that *writes* one of its capabilities cannot
+    // claim to have copied it from anywhere — and a bundle that copies all of them
+    // must keep saying exactly what it said before this slice, byte for byte.
     lines.push(
-      "These capabilities are copied into this bundle, so nothing has to be installed for them. Invoke each by its bundled name — inside this bundle it is the name below, not the name it has where it was copied from:",
+      anyAuthored
+        ? "These capabilities ship inside this bundle — some written as part of this workflow, some copied in — so nothing has to be installed for them. Invoke each by its bundled name, which is the name below:"
+        : "These capabilities are copied into this bundle, so nothing has to be installed for them. Invoke each by its bundled name — inside this bundle it is the name below, not the name it has where it was copied from:",
     );
     lines.push("");
     for (const copy of plan.vendored.values()) {
+      // Where it came from is the one thing the two origins differ in, and it is what
+      // tells the reader whether there is an original to go back to.
+      const provenance =
+        copy.origin === "authored"
+          ? "authored in this workflow"
+          : `copied from \`${artifactSpanText(copy.sourceName)}\``;
       lines.push(
-        `- ${artifactNoun(copy.kind)} \`${artifactSpanText(invocationName(plan, copy))}\` — bundled at \`${codeSpanText(copy.path)}\`, copied from \`${artifactSpanText(copy.sourceName)}\``,
+        `- ${artifactNoun(copy.kind)} \`${artifactSpanText(invocationName(plan, copy))}\` — bundled at \`${codeSpanText(copy.path)}\`, ${provenance}`,
       );
     }
     lines.push("");
@@ -1478,7 +1689,7 @@ const PLUGIN_MANIFEST_PATH = ".claude-plugin/plugin.json";
  * so marking it as a plugin would assert something it does not need.
  *
  * `JSON.stringify` is the escaping boundary for the workflow's untrusted name and
- * description here, the way `stringifyYaml` is for the umbrella's frontmatter.
+ * description here, the way `stringifyFrontmatter` is for the umbrella's frontmatter.
  */
 function pluginManifest(doc: PatchworkDocument, plan: BundlePlan): BundleFile[] {
   if (plan.vendored.size === 0) return [];

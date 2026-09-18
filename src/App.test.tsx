@@ -764,3 +764,69 @@ describe("A document with more branches than the export allows", () => {
     expect(saved.edges).toHaveLength(302);
   });
 });
+
+/** A saved workflow whose one Skill node was written in the graph, not imported. */
+const AUTHORED_DOCUMENT = JSON.stringify({
+  schemaVersion: 6,
+  workflow: { name: "Bound", description: "A saved workflow." },
+  nodes: [
+    { id: "n1", type: "input", label: "In", data: { parameters: [{ name: "topic" }] } },
+    {
+      id: "n2",
+      type: "skill",
+      label: "Triage",
+      data: {
+        source: "authored",
+        description: "Triage an incoming bug report.",
+        body: "# Triage\n\nRead the report.\n",
+      },
+    },
+    { id: "n3", type: "output", label: "Out", data: { description: "the answer" } },
+  ],
+  edges: [
+    { id: "e1", source: "n1", target: "n2" },
+    { id: "e2", source: "n2", target: "n3" },
+  ],
+});
+
+describe("Exporting a workflow whose capability was authored in it", () => {
+  it("given_anAuthoredNodeAndNoArtifactsAnywhere_whenExported_thenTheBundleCarriesTheArtifactItself", async () => {
+    // The end of the slice, through the app: nothing is installed, no root resolves
+    // anything, and the exported bundle is still complete.
+    bridge.scanRoots.mockResolvedValue({ artifacts: [], problems: [] });
+    bridge.readDocument.mockResolvedValue(AUTHORED_DOCUMENT);
+    bridge.pickExportDirectory.mockResolvedValue("/out");
+    bridge.exportBundle.mockResolvedValue("/out/patchwork-bound");
+
+    render(<App />);
+    fireEvent.click(screen.getByText("Load"));
+    await waitFor(() => expect(screen.getByText(/Loaded/)).toBeTruthy());
+    fireEvent.click(screen.getByText("Export"));
+
+    await waitFor(() => expect(bridge.exportBundle).toHaveBeenCalled());
+    const [tree] = bridge.exportBundle.mock.calls[0] as [
+      { files: Array<{ path: string; contents: string }> },
+    ];
+    expect(tree.files.map((f) => f.path)).toEqual([
+      "skills/triage/SKILL.md",
+      ".claude-plugin/plugin.json",
+      "SKILL.md",
+    ]);
+    expect(tree.files[0].contents).toBe(
+      "---\nname: triage\ndescription: Triage an incoming bug report.\n---\n\n# Triage\n\nRead the report.\n",
+    );
+  });
+
+  it("given_anAuthoredNode_whenLoaded_thenItIsNotCountedAsAnUnresolvedReference", async () => {
+    // It depends on no source root, so the notice about references that resolve to
+    // nothing must not claim it.
+    bridge.scanRoots.mockResolvedValue({ artifacts: [], problems: [] });
+    bridge.readDocument.mockResolvedValue(AUTHORED_DOCUMENT);
+
+    render(<App />);
+    fireEvent.click(screen.getByText("Load"));
+    await waitFor(() => expect(screen.getByText(/Loaded/)).toBeTruthy());
+
+    expect(screen.queryByText(UNRESOLVED_NOTICE)).toBeNull();
+  });
+});

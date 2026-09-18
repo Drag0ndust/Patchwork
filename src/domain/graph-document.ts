@@ -7,8 +7,11 @@
  */
 
 import {
+  artifactRelativePath,
   isValidArtifactName,
+  isValidAuthoredArtifactName,
   MAX_NAME_SEGMENT_LENGTH,
+  parseArtifactLocation,
   type ArtifactKind,
 } from "./artifact-codec";
 // The plan is how a document is *followed*, and both halves of the project need
@@ -19,16 +22,23 @@ import { fanInInputs, nestingDepth, planWorkflow } from "./workflow-order";
 import type { WorkflowPlan } from "./workflow-order";
 
 /**
- * Bumped to 5 in slices 5 and 7: a `conditional` node can be **rule-based** (the
- * `rule` its `mode` selects, evaluated by the exported control scaffold rather
- * than by the model), and an edge can carry the `inputLabel` its result arrives
- * under where several paths fan in.
+ * Bumped to 7 in slice 8: a `skill`/`agent` node's artifact can be **authored in
+ * the graph** rather than imported from a source root — its frontmatter fields and
+ * its Markdown body are carried in the document itself, which is what makes a
+ * `.patchwork` file with a capability nobody has installed still shareable.
  *
- * (4 added the `conditional` node type and an edge's `branch`; 3 recorded, per
- * `skill`/`agent` node, *how* it is exported — referenced by name, or
- * vendor-copied into the bundle.) `deserialize` migrates older documents forward.
+ * **6 is not this slice's**, and the number is why this one is 7: two branches in
+ * flight both called themselves 6 for unrelated formats, and a version number that no
+ * longer identifies a format opens a document into an error about a field the reader
+ * has never heard of. 6 belongs to the branch that landed first (a cycle's iteration
+ * guard); this one takes the next number and migrates through it.
+ *
+ * (5 made a `conditional` rule-based and gave an edge its `inputLabel`; 4 added the
+ * `conditional` node type and an edge's `branch`; 3 recorded, per `skill`/`agent`
+ * node, *how* it is exported — referenced by name, or vendor-copied into the
+ * bundle.) `deserialize` migrates older documents forward.
  */
-export const CURRENT_SCHEMA_VERSION = 5;
+export const CURRENT_SCHEMA_VERSION = 7;
 
 /** The oldest document version that still opens (via forward migration). */
 export const MIN_SUPPORTED_SCHEMA_VERSION = 1;
@@ -80,10 +90,33 @@ export interface OutputData {
  * of the configured root it was imported from — never an absolute path. That
  * way precedence resolution re-runs every time the document is opened, and a
  * moved or removed root leaves the node unresolved instead of stale.
+ *
+ * A node that was *switched back* from authoring also carries the authored fields
+ * (`description`, `body`, `tools`, `model`, `effort`), and they are **present but
+ * ignored**: every path reads an artifact node through [`artifactSourceOf`], so an
+ * imported node's prose is never emitted and never reaches the umbrella. They are kept
+ * rather than stripped so that flipping the source select back returns the body the
+ * author wrote — losing it to a mis-click is a real loss, and the fields it would be
+ * carried in are these ones. See [`asImported`] in the dock.
+ *
+ * The one authored field that is **not** carried is the `name`, in either direction.
+ * This shape's `name` is the binding to an installed artifact — it is the field the
+ * picker writes — so there is nowhere here to park an authored name, and an authored
+ * node built from this one must not inherit it (that would author an artifact claiming
+ * an installed one's name). Parking it in a second key instead would put a field in
+ * every saved document whose only job is undoing a select, so an authored name typed
+ * before a trip through `imported` is typed again on the way back; the dock says so at
+ * once, because a nameless authored artifact is a problem it reports live. ADR-0007.
  */
 export interface ArtifactRefData {
   name: string;
   rootId: string;
+  /**
+   * Where this node's artifact comes from. Optional on the *type* only, for the
+   * reason `exportMode` is: every document written before slice 8 omits it, and
+   * every path that needs the value goes through [`artifactSourceOf`].
+   */
+  source?: "imported";
   /**
    * How the export treats this node. Optional on the *type* only so that a v2
    * document and a hand-edited one are both readable without a repair step —
@@ -113,9 +146,328 @@ const EXPORT_MODES: ExportMode[] = ["reference", "vendor"];
  */
 export const DEFAULT_EXPORT_MODE: ExportMode = "reference";
 
-/** The export mode a `skill`/`agent` node's stored reference asks for. */
+/**
+ * The export mode a `skill`/`agent` node's stored reference asks for.
+ *
+ * Total, for the reason [`asText`] is: `assertNodeShape` checks this field on an
+ * *imported* node but deliberately leaves an authored node's carried copy of it
+ * untyped, and the dock writes that copy back into the imported shape when the source
+ * select is flipped. Anything that is not one of the two modes is the default — the
+ * same answer absence gets — so a hand-edited file cannot travel through the dock and
+ * come out as a document that will not open again (issue #27).
+ */
 export function exportModeOf(data: ArtifactRefData): ExportMode {
-  return data.exportMode ?? DEFAULT_EXPORT_MODE;
+  return EXPORT_MODES.includes(data.exportMode as ExportMode)
+    ? (data.exportMode as ExportMode)
+    : DEFAULT_EXPORT_MODE;
+}
+
+/**
+ * Where a `skill`/`agent` node's artifact comes from.
+ *
+ * - `imported` — it lives in one of the user's source roots and the node holds a
+ *   symbolic reference to it (slices 2 and 3).
+ * - `authored` — it was written **here**, in this graph, and the document carries
+ *   its fields and its body. There is no file anywhere until the workflow is
+ *   exported. See ADR-0007.
+ */
+export type ArtifactSource = "imported" | "authored";
+
+const ARTIFACT_SOURCES: ArtifactSource[] = ["imported", "authored"];
+
+/**
+ * Importing is the default, because it is what every document written before this
+ * slice means — a v6 artifact node has no `source` and is a reference to something
+ * on disk, which is exactly what it was.
+ */
+export const DEFAULT_ARTIFACT_SOURCE: ArtifactSource = "imported";
+
+/**
+ * A `skill`/`agent` artifact **authored in the graph**.
+ *
+ * Stored as *fields plus a body* rather than as file text: the frontmatter is
+ * derived at emit time by the Artifact Codec (`composeArtifact`), so what the form
+ * collects is the artifact and the emitted YAML is valid by construction. The
+ * reverse — keeping the file text and parsing it back — is what an *imported*
+ * artifact does, because there the bytes are the user's and must survive untouched.
+ *
+ * `name` is optional, and it is the one asymmetry between the two kinds: an agent
+ * *is* the file `agents/<name>.md` and nothing else names it, while a skill is a
+ * directory Patchwork mints and the graph already has a name for it — the node's
+ * own label. Both kinds *carry* one, though, and for a skill it is the way out of a
+ * label that has nothing a file name can be built from — which is every label written
+ * in a script that is not Latin. See [`authoredArtifactName`] and ADR-0007.
+ */
+export interface AuthoredArtifactData {
+  source: "authored";
+  name?: string;
+  description: string;
+  /** The curated Advanced frontmatter surface; blank entries are never emitted. */
+  tools?: string;
+  model?: string;
+  effort?: string;
+  /** The Markdown below the frontmatter, seeded from a type-specific scaffold. */
+  body: string;
+}
+
+/** A `skill`/`agent` node's data, whichever way its artifact came to be. */
+export type ArtifactNodeData = ArtifactRefData | AuthoredArtifactData;
+
+/** Where a `skill`/`agent` node's stored data says its artifact comes from. */
+export function artifactSourceOf(data: ArtifactNodeData): ArtifactSource {
+  return data.source ?? DEFAULT_ARTIFACT_SOURCE;
+}
+
+/**
+ * The artifact a node authored, or `undefined` for anything else — an imported
+ * reference, a node of another type, or data a hand-edited document made nonsense of.
+ *
+ * Tolerant by design, like [`branchesOf`]: the canvas, the dock and the compiler all
+ * ask this of node data that may never have been through `deserialize`, and every one
+ * of them must degrade rather than throw (issue #27).
+ */
+export function authoredArtifactOf(node: GraphNode): AuthoredArtifactData | undefined {
+  if (!artifactKindOf(node.type)) return undefined;
+  const data = node.data as AuthoredArtifactData | undefined;
+  if (data === undefined || data === null || typeof data !== "object") return undefined;
+  return data.source === "authored" ? data : undefined;
+}
+
+/**
+ * A free-text field of in-memory node data, read as the text it is meant to be.
+ *
+ * Every field this module and the codec treat as prose is reached through here, for
+ * the reason [`authoredArtifactOf`] is tolerant: the canvas, the dock and the compiler
+ * all ask these questions of node data that never went through `deserialize`, and a
+ * number where a description belongs owes the user an error list rather than a
+ * TypeError (issue #27). A value that is not text is a field with nothing in it, which
+ * is exactly what the required-field errors below already say.
+ */
+export function asText(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+/**
+ * What an authored artifact is called — the name it is invoked by, and the name its
+ * location inside the bundle has to yield back.
+ *
+ * A skill with no name of its own is named by **the node's label**, slugged the way
+ * the workflow name is slugged into the bundle directory. That is not a convenience:
+ * an artifact's identity normally comes from its location on disk (ADR-0001) and an
+ * authored one has no location yet, so its identity has to come from the only place
+ * left — the graph. The node's label is what the graph already calls it, and it is
+ * what a reader sees on the canvas.
+ *
+ * An **agent** gets no such fallback. It is a single file `agents/<name>.md`, so the
+ * name is the file, and Patchwork inventing one from a label the author has not
+ * revisited would put a file on disk under a name nobody chose. `validateGraph`
+ * refuses an unnamed authored agent instead. See ADR-0007.
+ */
+export function authoredArtifactName(node: GraphNode): string {
+  const authored = authoredArtifactOf(node);
+  if (authored === undefined) return "";
+  const declared = asText(authored.name).trim();
+  if (declared !== "") return declared;
+  // [`rawSlug`], **not** [`slugify`]: the fallback to the literal `"workflow"` belongs
+  // to the bundle directory, which must be called something. Borrowing it here named
+  // every skill whose label is not Latin script `workflow` — a Chinese or Greek
+  // author's artifacts silently misnamed, and two of them colliding on a name nobody
+  // typed. A label that produces nothing produces no name, and `authoredArtifactErrors`
+  // asks for one.
+  return node.type === "skill" ? rawSlug(asText(node.label)) : "";
+}
+
+/** An artifact that already exists where an authored one might be written. */
+export interface InstalledArtifact {
+  kind: ArtifactKind;
+  name: string;
+}
+
+/**
+ * Every problem with the authored artifacts in a graph, per node.
+ *
+ * **One rule, two surfaces.** `validateGraph` asks it of the document alone, and the
+ * dock asks it of the same nodes plus the artifacts the import catalog resolved — so
+ * what the editor says while you type and what the export refuses cannot drift apart,
+ * the way the dock's operand check and the validator's already cannot.
+ *
+ * The difference the second argument makes is the whole of "collision-at-write":
+ *
+ * - a clash with **another authored node** is an error either way, because two
+ *   authored artifacts with one name land on one path inside the bundle and only one
+ *   file can exist there;
+ * - a clash with an **installed** artifact is reported only where the catalog is
+ *   known, because it is not an export problem at all — a bundle is its own namespace
+ *   (ADR-0002) — but it is exactly what will bite when the artifact is promoted to a
+ *   source root, and learning it then is too late.
+ *
+ * The third argument is the **bundle directory** the document compiles into, and it
+ * carries the one authored-name rule that is not a property of the name alone: the
+ * directory is the namespace, so it is `<bundleDir>:<name>` that Claude Code resolves,
+ * and two segments that are each acceptable can still overrun the whole-name bound
+ * together. Passed by both surfaces — the validator derives it from the workflow name
+ * and the dock is handed the same one — because a check only one of them can run is
+ * exactly the drift this function exists to prevent. Omitted, the bound is not
+ * invented: a caller that does not know the directory does not know the answer.
+ *
+ * Never throws, for the reason `validateGraph` never does: it is asked of in-memory
+ * node data that a hand edit may have made nonsense of.
+ */
+export function authoredArtifactErrors(
+  nodes: readonly GraphNode[],
+  installed: readonly InstalledArtifact[] = [],
+  bundleDir = "",
+): Map<string, string[]> {
+  const problems = new Map<string, string[]>();
+  const add = (id: string, message: string) => {
+    const existing = problems.get(id);
+    if (existing) existing.push(message);
+    else problems.set(id, [message]);
+  };
+
+  // Case-folded, because the bundle is written to a **filesystem**: the default one
+  // on macOS (APFS) and Windows (NTFS) treats `skills/triage/` and `skills/Triage/`
+  // as one directory, so two names that differ only in case are one file.
+  const claim = (kind: ArtifactKind, name: string) => `${kind} ${name.toLowerCase()}`;
+  const installedNames = new Set(installed.map((a) => claim(a.kind, a.name)));
+
+  /** The authored nodes claiming each name, so *both* sides of a clash are named. */
+  const claimants = new Map<string, GraphNode[]>();
+  const authoredNodes: Array<{ node: GraphNode; data: AuthoredArtifactData }> = [];
+  for (const node of nodes) {
+    const data = authoredArtifactOf(node);
+    if (data === undefined) continue;
+    authoredNodes.push({ node, data });
+    const name = authoredArtifactName(node);
+    if (name === "") continue;
+    const key = claim(artifactKindOf(node.type) as ArtifactKind, name);
+    claimants.set(key, [...(claimants.get(key) ?? []), node]);
+  }
+
+  for (const { node, data } of authoredNodes) {
+    const kind = artifactKindOf(node.type) as ArtifactKind;
+    const label = nodeLabelFor(kind);
+    const noun = kind === "skill" ? "skill" : "agent";
+
+    if (asText(data.description).trim() === "") {
+      add(
+        node.id,
+        `${label} node '${node.id}' authors a ${noun} with no description; Claude Code uses the description to decide when to invoke it, so it cannot be left empty`,
+      );
+    }
+    if (asText(data.body).trim() === "") {
+      add(
+        node.id,
+        `${label} node '${node.id}' authors a ${noun} with an empty body; the body is what Claude Code follows when it is invoked`,
+      );
+    }
+
+    const name = authoredArtifactName(node);
+    const nameProblem = authoredNameProblem(node, kind, name, bundleDir);
+    if (nameProblem !== undefined) {
+      add(node.id, nameProblem);
+      continue;
+    }
+
+    const key = claim(kind, name);
+    const others = (claimants.get(key) ?? []).filter((other) => other.id !== node.id);
+    if (others.length > 0) {
+      add(
+        node.id,
+        `${label} node '${node.id}' authors a ${noun} called '${name}', and so does node '${others.map((o) => o.id).join("', '")}'; they would be written to one file, so rename one of them`,
+      );
+    }
+    if (installedNames.has(key)) {
+      add(
+        node.id,
+        `${label} node '${node.id}' authors a ${noun} called '${name}', and a ${noun} of that name is already in your source roots — the export is unaffected (the bundle is its own namespace), but writing this one to a root would collide with it`,
+      );
+    }
+  }
+
+  return problems;
+}
+
+/** `Skill`/`Agent`, the way every error in this module says it. */
+function nodeLabelFor(kind: ArtifactKind): string {
+  return kind === "skill" ? "Skill" : "Agent";
+}
+
+/**
+ * Why this authored artifact could not be written under this name, or `undefined` when
+ * it can.
+ *
+ * Every rule here is about **the name and where it lands**, and the four are one
+ * function so that the dock cannot show a path the export would refuse: the same
+ * predicate decides the error list and [`authoredArtifactPathOf`], which is the only
+ * thing the dock is allowed to promise a path from. Ordered, and each one returns —
+ * a name that is not usable at all has nothing to say about the path it would take.
+ */
+function authoredNameProblem(
+  node: GraphNode,
+  kind: ArtifactKind,
+  name: string,
+  bundleDir: string,
+): string | undefined {
+  const label = nodeLabelFor(kind);
+  const noun = kind === "skill" ? "skill" : "agent";
+
+  if (name === "") {
+    // Two ways to have no name, and they are fixed differently. An agent never had a
+    // fallback: nothing but the author names the file `agents/<name>.md`. A skill is
+    // named by its node's label — but only when the label has something a file name
+    // can be built out of, which `caché`, `中文` and `!!!` do not. Saying "no name"
+    // to an author who *has* labelled the node is unactionable; the way out is the
+    // explicit name the skill form also carries, so the message names it.
+    return kind === "skill"
+      ? `${label} node '${node.id}' authors a ${noun} named after its label, and '${asText(node.label).slice(0, MAX_NAME_SEGMENT_LENGTH)}' has no letters or digits a file name can be built from; give it a name of its own under Advanced`
+      : `${label} node '${node.id}' authors a ${noun} with no name; an agent is the file 'agents/<name>.md', so nothing else says what it is called`;
+  }
+  if (!isValidAuthoredArtifactName(name)) {
+    return `${label} node '${node.id}' would author '${name.slice(0, MAX_NAME_SEGMENT_LENGTH * 2)}', which is not a usable artifact name (letters, digits, '.', '_' or '-'; no ':' — the bundle is already the namespace; not a Windows device name such as 'CON' or 'NUL'; at most ${MAX_NAME_SEGMENT_LENGTH} characters)`;
+  }
+
+  // And the path has to name the artifact back. `artifactRelativePath` is not injective
+  // in the other direction for every input: an agent named `SKILL` lands at
+  // `agents/SKILL.md`, which the layout rule says is not an artifact at all — so the
+  // file would sit in the bundle under a name nothing resolves. Asserting the round
+  // trip closes that whole class instead of banning one name.
+  const path = artifactRelativePath(kind, name);
+  const located = parseArtifactLocation(path);
+  if (located?.kind !== kind || located.name !== name) {
+    return `${label} node '${node.id}' authors a ${noun} called '${name}', but a copy at '${path}' would not be discoverable as '${name}' — rename it`;
+  }
+
+  // The bundle directory is the artifact's namespace, and it is the *joined* name
+  // Claude Code resolves: two segments that are each acceptable can still overrun the
+  // whole-name bound together (a 64-character directory and a 64-character name make
+  // 129). Only asked where the directory is known — see [`authoredArtifactErrors`].
+  if (bundleDir !== "" && !isValidArtifactName(`${bundleDir}:${name}`)) {
+    return `${label} node '${node.id}' authors a ${noun} called '${name}', but inside the bundle it would be invoked as '${bundleDir}:${name}', which is not a name Claude Code can resolve — shorten the workflow name, or give the ${noun} a shorter name`;
+  }
+
+  return undefined;
+}
+
+/**
+ * Where this node's authored artifact would be written inside the bundle, or
+ * `undefined` when it would not be written at all.
+ *
+ * The dock's "Exported as" line is this and nothing else. It used to re-derive the
+ * path from the name-validity rule alone, which is a *weaker* test than the export's:
+ * an agent named `SKILL`, or a name that overran the invocation bound, got a path
+ * printed under it that no export would ever produce. One function answers both, so
+ * the promise and the refusal are the same decision.
+ */
+export function authoredArtifactPathOf(
+  node: GraphNode,
+  bundleDir = "",
+): string | undefined {
+  const kind = artifactKindOf(node.type);
+  if (!kind || authoredArtifactOf(node) === undefined) return undefined;
+  const name = authoredArtifactName(node);
+  if (authoredNameProblem(node, kind, name, bundleDir) !== undefined) return undefined;
+  return artifactRelativePath(kind, name);
 }
 
 /**
@@ -408,6 +760,7 @@ export type NodeData =
   | PromptData
   | OutputData
   | ArtifactRefData
+  | AuthoredArtifactData
   | ConditionalData;
 
 export interface Position {
@@ -500,13 +853,20 @@ export function slugify(name: string): string {
  * file name out of.
  *
  * Separate from [`slugify`] so `validateGraph` can tell "slugs to nothing" from "slugs
- * to `workflow`" (a name that *is* `workflow` is fine) without re-deriving the rule.
+ * to `workflow`" (a name that *is* `workflow` is fine) without re-deriving the rule —
+ * and so [`authoredArtifactName`], which has no directory to name and no business
+ * inventing one, can ask the same question of a node's label.
  * Asking this rather than testing the name against `[a-z0-9]` matters because the slug
  * comes off the *lowercased* name, and lowercasing can make a character usable: `İ`
  * (U+0130) is not `[a-z0-9]`, yet it slugs to `i`.
  */
 function rawSlug(name: string): string {
   return name
+    // Normalized first, because the slug is also an artifact's *identity* when a node's
+    // label names what it authors: `café` typed on a Mac (decomposed) and `café` pasted
+    // from the web (composed) are one word to every reader, and without this they slug
+    // to `cafe-` and `caf-` — two artifacts, no collision reported between them.
+    .normalize("NFC")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
@@ -535,6 +895,18 @@ const EMITTER_NAME_COST = 1 + 11 + 8 + 11 + 20;
 
 /** The prefix `compile` puts in front of the slug to form the bundle directory. */
 export const BUNDLE_DIR_PREFIX = "patchwork-";
+
+/**
+ * The bundle directory a workflow of this name compiles into — which is also the
+ * **namespace** everything in the bundle is invoked under.
+ *
+ * Stated once and asked by all three surfaces (the compiler, `validateGraph` and the
+ * dock) rather than re-derived, because an authored name is only exportable relative
+ * to it: see the `bundleDir` argument of [`authoredArtifactErrors`].
+ */
+export function bundleDirNameFor(workflowName: string): string {
+  return `${BUNDLE_DIR_PREFIX}${slugify(workflowName)}`;
+}
 
 /**
  * What the *filesystem* allows the bundle directory to be called, once the room
@@ -652,7 +1024,13 @@ export function validateGraph(doc: PatchworkDocument): ValidationResult {
     );
   }
 
+  const authoredProblems = authoredArtifactErrors(doc.nodes, [], bundleDirNameFor(name));
   errors.push(...contentErrors(doc));
+  // Asked of the document alone, so a clash with something *installed* is not an
+  // export refusal — only the dock passes the catalog. See `authoredArtifactErrors`.
+  for (const node of doc.nodes) {
+    errors.push(...(authoredProblems.get(node.id) ?? []));
+  }
   errors.push(...branchWiringErrors(doc, nodeIds));
   errors.push(...inputLabelErrors(doc));
 
@@ -871,7 +1249,11 @@ function contentErrors(doc: PatchworkDocument): string[] {
     } else if (node.type === "conditional") {
       errors.push(...conditionalErrors(node));
     } else if (artifactKindOf(node.type)) {
-      errors.push(...artifactRefErrors(node));
+      // An authored artifact has no source root and no reference to resolve; what it
+      // *does* need is checked once, for both surfaces, by `authoredArtifactErrors`.
+      if (authoredArtifactOf(node) === undefined) {
+        errors.push(...artifactRefErrors(node));
+      }
     }
   }
   return errors;
@@ -1217,9 +1599,12 @@ function branchWiringErrors(
 /** Reject a `skill`/`agent` node that is not bound to a usable artifact. */
 function artifactRefErrors(node: GraphNode): string[] {
   const errors: string[] = [];
-  const label = node.type === "skill" ? "Skill" : "Agent";
-  const ref = node.data as ArtifactRefData;
-  const name = (ref.name ?? "").trim();
+  const label = nodeLabelFor(artifactKindOf(node.type) as ArtifactKind);
+  // Read as possibly-absent, the convention every other read of node data here
+  // follows: `validateGraph` is asked of in-memory nodes a hand edit may have emptied,
+  // and it owes the user an error list rather than a TypeError (issue #27).
+  const ref = node.data as ArtifactRefData | undefined;
+  const name = asText(ref?.name).trim();
 
   if (name === "") {
     errors.push(
@@ -1228,10 +1613,10 @@ function artifactRefErrors(node: GraphNode): string[] {
   } else if (!isValidArtifactName(name)) {
     // The name is rendered into an inline code span in the umbrella skill.
     errors.push(
-      `${label} node '${node.id}' references '${ref.name}', which is not a usable artifact name`,
+      `${label} node '${node.id}' references '${ref?.name}', which is not a usable artifact name`,
     );
   }
-  if ((ref.rootId ?? "").trim() === "") {
+  if ((ref?.rootId ?? "").trim() === "") {
     errors.push(
       `${label} node '${node.id}' is missing the source root its artifact came from`,
     );
@@ -1450,7 +1835,9 @@ export function deserialize(json: string): PatchworkDocument {
  * reference is a valid v3 one) and only rejects a present-but-unknown value. It
  * remains true for v3 -> v4, which only *widens* the vocabulary — a node type and an
  * optional edge field that no older document uses — so nothing an older document
- * contains became invalid. The first migration that *renames or retypes* a node's
+ * contains became invalid. It is still true for v6 -> v7, which adds an artifact
+ * node's `source`: `assertNodeShape` reads its *absence* as an imported reference and
+ * checks exactly the contract a v6 node already satisfied. The first migration that *renames or retypes* a node's
  * `data`, or retires a node type, would therefore see its input rejected by
  * validation before it could ever run: adding such a step means moving `assertNodeShape`/`assertEdgeShape` after
  * `migrateToCurrent` (and hardening the migrations themselves against malformed
@@ -1488,6 +1875,15 @@ const MIGRATIONS: Record<number, (doc: PatchworkDocument) => PatchworkDocument> 
   // which is exactly what it still means, and no v4 edge carries an input label — so
   // a v4 document is already a valid v5 document.
   4: (doc) => ({ ...doc, schemaVersion: 5 }),
+  // v5 -> v6: a cycle may carry an iteration guard. Another widening, and not this
+  // slice's — the step is kept so the chain has no hole and a v5 document still walks
+  // all the way forward. See [`CURRENT_SCHEMA_VERSION`].
+  5: (doc) => ({ ...doc, schemaVersion: 6 }),
+  // v6 -> v7: a `skill`/`agent` node's artifact may be authored in the graph. A
+  // widening again — an artifact node with no `source` is an imported reference,
+  // which is exactly what every earlier artifact node already was — so a v6 document is
+  // already a valid v7 document and the migration only records the version.
+  6: (doc) => ({ ...doc, schemaVersion: 7 }),
 };
 
 function migrateToCurrent(doc: PatchworkDocument): PatchworkDocument {
@@ -1585,6 +1981,34 @@ function assertNodeShape(raw: unknown, index: number): void {
     case "skill":
     case "agent": {
       const label = node.type === "skill" ? "Skill" : "Agent";
+      // Absent is fine — that is every document written before authoring existed, and
+      // `artifactSourceOf` reads it as an imported reference. An unknown value is not:
+      // the two sources are read by *different* contracts below, so guessing would
+      // mean checking the wrong one and letting a malformed node through.
+      if (
+        data.source !== undefined &&
+        !ARTIFACT_SOURCES.includes(data.source as ArtifactSource)
+      ) {
+        throw new Error(
+          `${label} node '${id}' has an invalid 'source' '${String(data.source)}' (expected one of ${ARTIFACT_SOURCES.join(", ")})`,
+        );
+      }
+      if (data.source === "authored") {
+        // The fields the codec composes an artifact out of. `name` is optional
+        // (a skill takes its node's label — see `authoredArtifactName`), and so are
+        // the Advanced ones; whether what is there is *usable* is `validateGraph`'s.
+        for (const field of ["description", "body"] as const) {
+          if (typeof data[field] !== "string") {
+            throw new Error(
+              `${label} node '${id}' authors an artifact and must have a string '${field}' (found ${describeType(data[field])})`,
+            );
+          }
+        }
+        for (const field of ["name", "tools", "model", "effort"] as const) {
+          assertOptionalText(data[field], `${label} node '${id}' '${field}'`);
+        }
+        break;
+      }
       if (typeof data.name !== "string") {
         throw new Error(
           `${label} node '${id}' must have a string 'name' naming the referenced artifact`,

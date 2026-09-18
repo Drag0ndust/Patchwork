@@ -801,3 +801,57 @@ describe("withInputLabels — a fan-in says on the canvas what each path carries
     expect(labelled.find((e) => e.id === "e3")?.label).toBe("Draft");
   });
 });
+
+describe("applyResolution — an authored artifact has nothing to resolve", () => {
+  /** A canvas holding one authored skill node. */
+  function authoredFlow() {
+    return documentToFlow({
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      workflow: { name: "Authored", description: "d" },
+      nodes: [
+        {
+          id: "n1",
+          type: "skill",
+          label: "Triage",
+          data: {
+            source: "authored",
+            description: "Triage a report.",
+            body: "# Triage\n",
+          },
+        },
+      ],
+      edges: [],
+    });
+  }
+
+  it("given_anAuthoredNode_whenResolved_thenItIsNeverFlaggedUnresolved", () => {
+    // Its artifact is in the document, not in a source root: looking for it there and
+    // flagging its absence would report a dependency the node does not have.
+    const resolved = applyResolution(authoredFlow().nodes, catalogWith([]));
+
+    expect(resolved[0].data.unresolved).toBe(false);
+  });
+
+  it("given_anAuthoredNodeWhoseNameMatchesNothingInstalled_whenResolved_thenNothingIsRewritten", () => {
+    const flow = authoredFlow();
+
+    expect(applyResolution(flow.nodes, catalogWith([["skill", "tdd"]]))).toEqual(
+      applyResolution(flow.nodes, catalogWith([])),
+    );
+  });
+
+  it("given_anAuthoredNode_whenRoundTrippedThroughTheCanvas_thenItsBodySurvives", () => {
+    const flow = authoredFlow();
+
+    const doc = flowToDocument(flow.nodes, flow.edges, {
+      name: "Authored",
+      description: "d",
+    });
+
+    expect(doc.nodes[0].data).toEqual({
+      source: "authored",
+      description: "Triage a report.",
+      body: "# Triage\n",
+    });
+  });
+});

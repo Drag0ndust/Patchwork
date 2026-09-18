@@ -1,11 +1,14 @@
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import {
+  authoredArtifactName,
+  authoredArtifactOf,
   branchesWithinLimit,
   conditionalModeOf,
   describeRule,
   MAX_BRANCHES_PER_CONDITIONAL,
   type ArtifactRefData,
   type ConditionalData,
+  type GraphNode,
   type InputData,
   type OutputData,
   type PromptData,
@@ -64,32 +67,49 @@ export function OutputNode({ data, selected }: NodeProps<PatchNode>) {
 }
 
 /**
- * A node bound to an imported artifact. Rendered for both kinds, because the
- * only difference on the canvas is the label and how the reference is invoked.
+ * A node whose step is an artifact. Rendered for both kinds, because the only
+ * difference on the canvas is the label and how the artifact is invoked — and for
+ * both ways an artifact comes to be, because *that* difference is worth a glance.
+ *
+ * An **authored** artifact was written in this graph: it ships inside the exported
+ * bundle, there is no reference to resolve, and the name it will be invoked by is
+ * derived (a skill takes its node's label — see `authoredArtifactName`). So it says
+ * so in its header, shows the derived name, and never carries the unresolved flag —
+ * that flag would claim a dependency on a source root the node does not have.
  */
 function ArtifactRefNode({
   data,
   selected,
   kind,
 }: NodeProps<PatchNode> & { kind: "skill" | "agent" }) {
-  const ref = data.node as ArtifactRefData | undefined;
-  const name = ref?.name ?? "";
-  const unresolved = data.unresolved === true;
+  const label = kind === "skill" ? "Skill" : "Agent";
+  const node: GraphNode = {
+    id: "",
+    type: kind,
+    label: data.label,
+    data: data.node,
+  };
+  const authored = authoredArtifactOf(node);
+  const name =
+    authored === undefined
+      ? ((data.node as ArtifactRefData | undefined)?.name ?? "")
+      : authoredArtifactName(node);
+  // Only an imported reference can be unresolved; see the note above.
+  const unresolved = authored === undefined && data.unresolved === true;
+  const missing = authored === undefined ? "no artifact bound" : "not named yet";
 
   return (
     <div
       className={`pw-node pw-node--${kind}${selected ? " is-selected" : ""}${
-        unresolved ? " is-unresolved" : ""
-      }`}
+        authored ? " is-authored" : ""
+      }${unresolved ? " is-unresolved" : ""}`}
     >
       <Handle type="target" position={Position.Left} />
-      <header className="pw-node__type">{kind === "skill" ? "Skill" : "Agent"}</header>
+      <header className="pw-node__type">{authored ? `${label} · Authored` : label}</header>
       <div className="pw-node__label">
         {data.label || (kind === "skill" ? "Untitled skill" : "Untitled agent")}
       </div>
-      <div className="pw-node__detail">
-        {name === "" ? "no artifact bound" : name}
-      </div>
+      <div className="pw-node__detail">{name === "" ? missing : name}</div>
       {unresolved && (
         <div className="pw-node__warning">unresolved — not in any source root</div>
       )}

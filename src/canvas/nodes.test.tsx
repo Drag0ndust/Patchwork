@@ -14,8 +14,9 @@ import {
   branchesWithinLimit,
   MAX_BRANCHES_PER_CONDITIONAL,
   type ConditionalData,
+  type NodeData,
 } from "../domain/graph-document";
-import { ConditionalNode } from "./nodes";
+import { AgentNode, ConditionalNode, SkillNode } from "./nodes";
 import type { PatchNode } from "./react-flow-adapter";
 
 function conditionalWith(branches: number, override: Partial<ConditionalData> = {}) {
@@ -168,4 +169,93 @@ describe("ConditionalNode — which of the two things decides this branch", () =
       expect(screen.getByText("no rule")).toBeTruthy();
     },
   );
+});
+
+/**
+ * A `skill`/`agent` node whose artifact was written in the graph reads differently
+ * from one bound to something installed: there is no reference to resolve, and the
+ * name it will be exported under is derived rather than picked.
+ */
+function artifactNode(
+  kind: "skill" | "agent",
+  node: NodeData,
+  label = "Triage",
+  unresolved = false,
+) {
+  const props = {
+    id: "n2",
+    type: kind,
+    data: { label, node, unresolved },
+    selected: false,
+  } as unknown as NodeProps<PatchNode>;
+  const Node = kind === "skill" ? SkillNode : AgentNode;
+  return render(
+    <ReactFlowProvider>
+      <Node {...props} />
+    </ReactFlowProvider>,
+  );
+}
+
+describe("SkillNode / AgentNode — an authored artifact is not an imported one", () => {
+  it("given_anAuthoredSkill_whenRendered_thenTheNodeSaysItWasWrittenHere", () => {
+    // Where a capability comes from is the most consequential thing about the node —
+    // one ships in the bundle, the other has to be installed — so it is read off the
+    // canvas, not only out of the dock.
+    artifactNode("skill", {
+      source: "authored",
+      description: "Triage a report.",
+      body: "# Triage\n",
+    });
+
+    expect(screen.getByText("Skill · Authored")).toBeTruthy();
+  });
+
+  it("given_anAuthoredSkillWithNoNameOfItsOwn_whenRendered_thenItShowsTheNameItWillBeExportedUnder", () => {
+    artifactNode(
+      "skill",
+      { source: "authored", description: "Triage a report.", body: "# Triage\n" },
+      "Bug Triage",
+    );
+
+    expect(screen.getByText("bug-triage")).toBeTruthy();
+  });
+
+  it("given_anAuthoredAgentWithNoNameYet_whenRendered_thenItReadsAsUnfinishedRatherThanBlank", () => {
+    artifactNode("agent", {
+      source: "authored",
+      name: "",
+      description: "Reviews a report.",
+      body: "You review.\n",
+    });
+
+    expect(screen.getByText("Agent · Authored")).toBeTruthy();
+    expect(screen.getByText("not named yet")).toBeTruthy();
+  });
+
+  it("given_anAuthoredSkill_whenRendered_thenItIsNeverFlaggedUnresolved", () => {
+    // Nothing on disk has to exist for it, so the warning an imported reference
+    // carries would be claiming a dependency it does not have.
+    const { container } = artifactNode(
+      "skill",
+      { source: "authored", description: "Triage.", body: "# Triage\n" },
+      "Triage",
+      true,
+    );
+
+    expect(container.querySelector(".pw-node__warning")).toBeNull();
+    expect(container.querySelector(".is-unresolved")).toBeNull();
+  });
+
+  it("given_anImportedSkill_whenRendered_thenItStillReadsExactlyAsItDidBefore", () => {
+    const { container } = artifactNode(
+      "skill",
+      { name: "tdd", rootId: "personal" },
+      "TDD",
+      true,
+    );
+
+    expect(screen.getByText("Skill")).toBeTruthy();
+    expect(screen.getByText("tdd")).toBeTruthy();
+    expect(container.querySelector(".pw-node__warning")).toBeTruthy();
+  });
 });

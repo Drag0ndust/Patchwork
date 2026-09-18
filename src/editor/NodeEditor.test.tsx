@@ -6,11 +6,14 @@ import {
   branchesWithinLimit,
   DEFAULT_RULE_OPERATOR,
   MAX_BRANCHES_PER_CONDITIONAL,
+  type ArtifactRefData,
+  type AuthoredArtifactData,
   type ConditionalData,
   type ConditionalRule,
   type ExportMode,
   type NodeData,
 } from "../domain/graph-document";
+import { artifactScaffold } from "../domain/artifact-scaffold";
 import { buildCatalog, type ImportCatalog } from "../import/catalog";
 import type { SourceRoot } from "../import/source-roots";
 import { NodeEditor } from "./NodeEditor";
@@ -918,5 +921,492 @@ describe("NodeEditor — choosing what decides a Conditional", () => {
         "Claude Code measures the value above and the control scaffold exported with this workflow compares it, so the same measured value always takes the same branch.",
       ),
     ).toBeTruthy();
+  });
+});
+
+/** A `skill`/`agent` node whose artifact was written in the graph. */
+function authoredNode(
+  kind: "skill" | "agent",
+  data: Partial<AuthoredArtifactData> = {},
+  label = "Triage",
+): PatchNode {
+  return {
+    id: "n2",
+    type: kind,
+    position: { x: 0, y: 0 },
+    data: {
+      label,
+      node: {
+        source: "authored",
+        description: "Triage a report.",
+        body: "# Triage\n\nRead it.\n",
+        ...data,
+      } as AuthoredArtifactData,
+    },
+  };
+}
+
+/** The `<details>` panel the fuller frontmatter surface is folded into. */
+function advancedPanel(container: HTMLElement): HTMLDetailsElement {
+  const panel = container.querySelector("details");
+  if (!panel) throw new Error("the dock has no Advanced panel");
+  return panel as HTMLDetailsElement;
+}
+
+describe("NodeEditor — where a node's artifact comes from", () => {
+  it("given_anImportedNode_whenRendered_thenBothWaysToGetAnArtifactAreOffered", () => {
+    render(<NodeEditor node={skillNode("tdd")} catalog={catalog()} onChange={vi.fn()} />);
+
+    const picker = screen.getByLabelText("Artifact") as HTMLSelectElement;
+    expect(picker.value).toBe("imported");
+    expect([...picker.options].map((o) => o.value)).toEqual(["imported", "authored"]);
+  });
+
+  it("given_anImportedNode_whenSwitchedToAuthored_thenTheEditorIsSeededWithATypeSpecificScaffold", () => {
+    // AC3: no blank slate. The hard part of writing a skill is knowing its shape, and
+    // the scaffold is the answer to that — see `artifactScaffold`.
+    const onChange = vi.fn();
+    render(
+      <NodeEditor node={skillNode("tdd")} catalog={catalog()} onChange={onChange} />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Artifact"), {
+      target: { value: "authored" },
+    });
+
+    const next = applied(onChange.mock.calls[0][2], {
+      name: "tdd",
+      rootId: PERSONAL.id,
+      exportMode: "reference",
+    }) as AuthoredArtifactData;
+    expect(next.source).toBe("authored");
+    expect(next.body).toBe(artifactScaffold("skill", "Skill"));
+    // Never the imported artifact's name: the two mean different things, and
+    // inheriting one would author a second artifact claiming an installed one's name.
+    expect(next.name).toBe("");
+  });
+
+  it("given_anAuthoredNodeWithProseAlready_whenSwitchedAwayAndBack_thenTheBodyIsNotOverwritten", () => {
+    // The scaffold is a starting point, not a reset: re-seeding over a written body
+    // would lose the work to a mis-click on a select.
+    const onChange = vi.fn();
+    render(
+      <NodeEditor
+        node={{
+          ...skillNode("tdd"),
+          data: {
+            label: "Skill",
+            node: {
+              name: "tdd",
+              rootId: PERSONAL.id,
+              exportMode: "reference",
+              description: "Triage a report.",
+              body: "# Mine\n\nWhat I wrote.\n",
+            } as NodeData,
+          },
+        }}
+        catalog={catalog()}
+        onChange={onChange}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Artifact"), {
+      target: { value: "authored" },
+    });
+
+    const next = applied(onChange.mock.calls[0][2], {
+      name: "tdd",
+      rootId: PERSONAL.id,
+      exportMode: "reference",
+      description: "Triage a report.",
+      body: "# Mine\n\nWhat I wrote.\n",
+    } as NodeData) as AuthoredArtifactData;
+    expect(next.body).toBe("# Mine\n\nWhat I wrote.\n");
+    expect(next.description).toBe("Triage a report.");
+  });
+
+  it("given_anAuthoredNode_whenSwitchedBackToImported_thenItIsUnboundAndTheProseIsKept", () => {
+    const onChange = vi.fn();
+    render(
+      <NodeEditor node={authoredNode("skill")} catalog={catalog()} onChange={onChange} />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Artifact"), {
+      target: { value: "imported" },
+    });
+
+    const next = applied(
+      onChange.mock.calls[0][2],
+      authoredNode("skill").data.node,
+    ) as ArtifactRefData & { body?: string };
+    expect(next.source).toBe("imported");
+    expect(next.name).toBe("");
+    expect(next.rootId).toBe("");
+    expect(next.body).toBe("# Triage\n\nRead it.\n");
+  });
+
+  it("given_anImportedNodeCarryingNonTextFields_whenSwitchedToAuthored_thenItReadsThemAsEmptyRatherThanThrowing", () => {
+    // `assertNodeShape` deliberately leaves an *imported* node's carried-over authoring
+    // fields untyped — that is what lets a switch back survive — so a hand-edited file
+    // holding a number where prose belongs opens cleanly and arrives here. The dock is
+    // the first surface that reads them as prose, and it degrades like every other one
+    // (issue #27): not text is a field with nothing in it.
+    const onChange = vi.fn();
+    const stray = {
+      name: "x",
+      rootId: PERSONAL.id,
+      exportMode: "reference",
+      body: 42,
+      description: { was: "an object" },
+      tools: ["Read"],
+      model: 7,
+      effort: null,
+    } as unknown as NodeData;
+    render(
+      <NodeEditor
+        node={{ ...skillNode("tdd"), data: { label: "Skill", node: stray } }}
+        catalog={catalog()}
+        onChange={onChange}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Artifact"), {
+      target: { value: "authored" },
+    });
+
+    const next = applied(onChange.mock.calls[0][2], stray) as AuthoredArtifactData;
+    expect(next.source).toBe("authored");
+    expect(next.description).toBe("");
+    // Nothing usable was carried, so this is the blank slate the scaffold is for.
+    expect(next.body).toBe(artifactScaffold("skill", "Skill"));
+    // Carried as text or not at all: a number left in `tools` would make the document
+    // this produced unopenable the next time it was saved.
+    expect(next.tools).toBe("");
+    expect(next.model).toBe("");
+    expect(next.effort).toBe("");
+  });
+
+  it("given_anAuthoredNodeCarryingAnExportModeThatIsNotOne_whenSwitchedToImported_thenAUsableModeIsWrittenBack", () => {
+    // An authored node's carried `exportMode` is not type-checked when the document is
+    // opened (there is no export choice to make while it is authored), and this is the
+    // transform that puts it back into the shape where it *is* checked. Writing the
+    // junk value on would produce a document the app itself could not reopen.
+    const onChange = vi.fn();
+    const node = authoredNode("skill", {
+      exportMode: 42,
+    } as unknown as Partial<AuthoredArtifactData>);
+    render(<NodeEditor node={node} catalog={catalog()} onChange={onChange} />);
+
+    fireEvent.change(screen.getByLabelText("Artifact"), { target: { value: "imported" } });
+
+    const next = applied(onChange.mock.calls[0][2], node.data.node) as ArtifactRefData;
+    expect(next.exportMode).toBe("reference");
+  });
+
+  it("given_anAuthoredNodeWithAName_whenSwitchedAwayAndBack_thenTheNameIsNotCarriedBack", () => {
+    // Deliberate, and the one field of the six that does not round-trip: an imported
+    // node's `name` is its binding to an installed artifact, so there is nowhere in that
+    // shape to park an authored name — parking it in a second key would put a field in
+    // every saved document whose only job is undoing a select. See `ArtifactRefData`.
+    const onChange = vi.fn();
+    const authored = authoredNode("skill", { name: "三分法", tools: "Read" });
+    const { rerender } = render(
+      <NodeEditor node={authored} catalog={catalog()} onChange={onChange} />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Artifact"), { target: { value: "imported" } });
+    const imported = applied(onChange.mock.calls[0][2], authored.data.node);
+
+    rerender(
+      <NodeEditor
+        node={{ ...authored, data: { label: "Triage", node: imported } }}
+        catalog={catalog()}
+        onChange={onChange}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("Artifact"), { target: { value: "authored" } });
+    const back = applied(onChange.mock.calls[1][2], imported) as AuthoredArtifactData;
+
+    expect(back.name).toBe("");
+    // Everything else the author wrote does come home.
+    expect(back.body).toBe("# Triage\n\nRead it.\n");
+    expect(back.description).toBe("Triage a report.");
+    expect(back.tools).toBe("Read");
+  });
+
+  it("given_anAuthoredNode_whenRendered_thenTheImportedPickerAndTheExportChoiceAreNotOffered", () => {
+    // There is nothing to pick and nothing to choose: an authored artifact has no
+    // original to reference, so it is always written into the bundle.
+    render(<NodeEditor node={authoredNode("skill")} catalog={catalog()} onChange={vi.fn()} />);
+
+    expect(screen.queryByLabelText("Imported skill")).toBeNull();
+    expect(screen.queryByLabelText("On export")).toBeNull();
+    expect(screen.getByText(/always written into the exported bundle/)).toBeTruthy();
+  });
+});
+
+describe("NodeEditor — authoring a skill or an agent from the node", () => {
+  it("given_anAuthoredSkill_whenRendered_thenTheOnlyFieldsInFrontOfTheAuthorAreTheOnesItNeeds", () => {
+    // AC1: the minimal skill is a description (and the prose). Its *name* is derived
+    // from the node's label, so it sits in Advanced as an override — ADR-0007.
+    const { container } = render(
+      <NodeEditor node={authoredNode("skill")} catalog={catalog()} onChange={vi.fn()} />,
+    );
+    const advanced = advancedPanel(container);
+
+    expect(advanced.contains(screen.getByLabelText("Description"))).toBe(false);
+    expect(advanced.contains(screen.getByLabelText("Instructions"))).toBe(false);
+    expect(advanced.contains(screen.getByLabelText("Name"))).toBe(true);
+  });
+
+  it("given_anAuthoredAgent_whenRendered_thenItsNameIsAskedForUpFront", () => {
+    // An agent *is* the file `agents/<name>.md`, so nothing else in the graph says
+    // what it is called.
+    const { container } = render(
+      <NodeEditor
+        node={authoredNode("agent", { name: "report-reviewer" })}
+        catalog={catalog()}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(advancedPanel(container).contains(screen.getByLabelText("Name"))).toBe(false);
+  });
+
+  it("given_anAuthoredNode_whenRendered_thenTheAdvancedFrontmatterIsFoldedAwayButPresent", () => {
+    // AC2: progressive disclosure — the fuller surface is one click away, not in the
+    // way of the two fields most artifacts only ever set.
+    const { container } = render(
+      <NodeEditor node={authoredNode("skill")} catalog={catalog()} onChange={vi.fn()} />,
+    );
+    const advanced = advancedPanel(container);
+
+    expect(advanced.open).toBe(false);
+    for (const field of ["Tools", "Model", "Effort"]) {
+      expect(advanced.contains(screen.getByLabelText(field))).toBe(true);
+    }
+  });
+
+  it.each([
+    ["Description", "description", "What it does."],
+    ["Instructions", "body", "# New\n"],
+    ["Name", "name", "bug-triage"],
+    ["Tools", "tools", "Read, Grep"],
+    ["Model", "model", "opus"],
+    ["Effort", "effort", "high"],
+  ])(
+    "given_theAuthored_%s_field_whenEdited_thenOnlyThatFieldChanges",
+    (fieldLabel, key, value) => {
+      const onChange = vi.fn();
+      render(
+        <NodeEditor node={authoredNode("skill")} catalog={catalog()} onChange={onChange} />,
+      );
+
+      fireEvent.change(screen.getByLabelText(fieldLabel), { target: { value } });
+
+      const current = authoredNode("skill").data.node;
+      const next = applied(onChange.mock.calls[0][2], current) as Record<string, unknown>;
+      expect(next[key]).toBe(value);
+      expect({ ...next, [key]: undefined }).toEqual({
+        ...(current as Record<string, unknown>),
+        [key]: undefined,
+      });
+    },
+  );
+
+  it("given_anAuthoredSkill_whenRendered_thenItSaysWhereTheArtifactWillBeWritten", () => {
+    // The derived name is only trustworthy if it is visible: it comes off the node's
+    // label, and this is the one place that says what that produced.
+    render(
+      <NodeEditor
+        node={authoredNode("skill", {}, "Bug Triage")}
+        catalog={catalog()}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("skills/bug-triage/SKILL.md")).toBeTruthy();
+  });
+
+  it("given_anAuthoredAgent_whenRendered_thenItSaysWhereTheArtifactWillBeWritten", () => {
+    render(
+      <NodeEditor
+        node={authoredNode("agent", { name: "report-reviewer" })}
+        catalog={catalog()}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("agents/report-reviewer.md")).toBeTruthy();
+  });
+});
+
+describe("NodeEditor — live validation of an authored artifact", () => {
+  it("given_anAuthoredSkillWithNoDescription_whenRendered_thenTheProblemIsSurfacedAsItIsTyped", () => {
+    // AC4, and the reason it is here rather than only at export: a required field
+    // nobody mentioned until the export button is a field discovered too late.
+    render(
+      <NodeEditor
+        node={authoredNode("skill", { description: "" })}
+        catalog={catalog()}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/no description/)).toBeTruthy();
+  });
+
+  it("given_anAuthoredAgentWithNoName_whenRendered_thenTheProblemIsSurfaced", () => {
+    render(
+      <NodeEditor
+        node={authoredNode("agent", { name: "" })}
+        catalog={catalog()}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/with no name/)).toBeTruthy();
+  });
+
+  it("given_anAuthoredNameThatCollidesWithAnInstalledArtifact_whenRendered_thenTheClashIsNamedBeforeItIsWritten", () => {
+    // Collision-at-write: `tdd` is in the catalog's personal root.
+    render(
+      <NodeEditor
+        node={authoredNode("skill", { name: "tdd" })}
+        catalog={catalog()}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/already in your source roots/)).toBeTruthy();
+  });
+
+  it("given_twoAuthoredNodesClaimingOneName_whenRendered_thenTheOtherNodeIsNamed", () => {
+    // They would be written to one file inside the bundle, so only one can have it.
+    render(
+      <NodeEditor
+        node={authoredNode("skill", { name: "triage" })}
+        nodes={[
+          authoredNode("skill", { name: "triage" }),
+          { ...authoredNode("skill", { name: "triage" }), id: "n7" },
+        ]}
+        catalog={catalog()}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/node 'n7'/)).toBeTruthy();
+  });
+
+  it("given_anAuthoredSkillWhoseLabelSlugsToNothing_whenRendered_thenTheDockSaysSoRatherThanShowingAPath", () => {
+    // A label in a non-Latin script produced no name at all, and the dock used to show
+    // `skills/workflow/SKILL.md` for it — a path the author never asked for, under a
+    // name they never typed.
+    const { container } = render(
+      <NodeEditor
+        node={authoredNode("skill", {}, "\u4e2d\u6587")}
+        catalog={catalog()}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(container.textContent).not.toContain("skills/workflow/SKILL.md");
+    expect(screen.getByText(/has no letters or digits a file name can be built from/)).toBeTruthy();
+  });
+
+  it("given_anAuthoredNameCarryingItsOwnNamespace_whenRendered_thenNoPathIsPromisedForIt", () => {
+    // The dock and the export must not disagree: `validateGraph` refuses this name, so
+    // showing where it would land would be promising a file that is never written.
+    const { container } = render(
+      <NodeEditor
+        node={authoredNode("skill", { name: "coding:tdd" })}
+        catalog={catalog()}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(container.textContent).not.toContain("skills/coding/skills/tdd/SKILL.md");
+    expect(screen.getByText(/nowhere in the bundle to write this/)).toBeTruthy();
+  });
+
+  it("given_anAuthoredAgentNamedSKILL_whenRendered_thenNoPathIsPromisedAndTheRefusalIsShownLive", () => {
+    // `agents/SKILL.md` is not an artifact under the layout rule, so the export refuses
+    // it. The dock used to print "Exported as `agents/SKILL.md`" all the same, and the
+    // refusal only arrived on the export click.
+    const { container } = render(
+      <NodeEditor
+        node={authoredNode("agent", { name: "SKILL" })}
+        catalog={catalog()}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(container.querySelector(".pw-ref code")).toBeNull();
+    expect(screen.getByText(/nowhere in the bundle to write this/)).toBeTruthy();
+    expect(screen.getByText(/would not be discoverable/)).toBeTruthy();
+  });
+
+  it("given_anAuthoredNameTooLongForTheWorkflowsNamespace_whenRendered_thenNoPathIsPromisedAndTheRefusalIsShownLive", () => {
+    // The dock is handed the workflow name for exactly this: the invocation is
+    // `<bundleDir>:<name>`, and a 64-character directory plus a 64-character name is a
+    // name Claude Code cannot resolve — which the dock cannot know on its own.
+    const { container } = render(
+      <NodeEditor
+        node={authoredNode("agent", { name: "a".repeat(64) })}
+        catalog={catalog()}
+        workflowName={"w".repeat(54)}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(container.textContent).not.toContain(`agents/${"a".repeat(64)}.md`);
+    expect(screen.getByText(/would be invoked as/)).toBeTruthy();
+  });
+
+  it("given_theSameNameUnderAShortWorkflowName_whenRendered_thenThePathIsPromisedAgain", () => {
+    const { container } = render(
+      <NodeEditor
+        node={authoredNode("agent", { name: "a".repeat(64) })}
+        catalog={catalog()}
+        workflowName="Triage"
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(container.textContent).toContain(`agents/${"a".repeat(64)}.md`);
+  });
+
+  it("given_aValidAuthoredArtifact_whenRendered_thenNothingIsFlagged", () => {
+    const { container } = render(
+      <NodeEditor node={authoredNode("skill")} catalog={catalog()} onChange={vi.fn()} />,
+    );
+
+    expect(container.querySelectorAll(".pw-ref--unresolved")).toHaveLength(0);
+  });
+
+  it("given_anAuthoredArtifactInEveryStateOfHalfFinished_whenRendered_thenTypingIsNeverRefusedAndNothingThrows", () => {
+    // Validation surfaces problems; it never blocks input, and it never takes the
+    // session to the error boundary for a field that is mid-edit.
+    for (const data of [
+      { description: "", body: "", name: "" },
+      { name: "not a name" },
+      { name: "a".repeat(200) },
+      { description: "   ", body: "   " },
+    ]) {
+      const onChange = vi.fn();
+      const { unmount } = render(
+        <NodeEditor
+          node={authoredNode("agent", data)}
+          catalog={catalog()}
+          onChange={onChange}
+        />,
+      );
+
+      fireEvent.change(screen.getByLabelText("Description"), {
+        target: { value: "Something." },
+      });
+      expect(onChange).toHaveBeenCalled();
+      unmount();
+    }
   });
 });

@@ -1,6 +1,12 @@
 import {
   artifactKindOf,
+  artifactSourceOf,
+  asText,
+  authoredArtifactErrors,
+  authoredArtifactName,
+  authoredArtifactPathOf,
   branchesWithinLimit,
+  bundleDirNameFor,
   conditionalModeOf,
   DEFAULT_RULE_OPERATOR,
   comparedOperand,
@@ -11,7 +17,10 @@ import {
   MAX_RULE_NUMBER_DIGITS,
   MIN_BRANCHES_PER_CONDITIONAL,
   NUMERIC_RULE_OPERATORS,
+  type ArtifactNodeData,
   type ArtifactRefData,
+  type ArtifactSource,
+  type AuthoredArtifactData,
   type Branch,
   type ConditionalData,
   type ConditionalMode,
@@ -27,12 +36,13 @@ import {
 } from "../domain/graph-document";
 import { newId } from "../domain/ids";
 import type { ArtifactKind } from "../domain/artifact-codec";
+import { artifactScaffold } from "../domain/artifact-scaffold";
 import {
   catalogArtifactsOfKind,
   findCatalogArtifact,
   type ImportCatalog,
 } from "../import/catalog";
-import type { PatchNode } from "../canvas/react-flow-adapter";
+import { toGraphNode, type PatchNode } from "../canvas/react-flow-adapter";
 
 /**
  * A node's new data, or a function producing it from the node's *current* data.
@@ -48,6 +58,28 @@ export type NodeDataEdit = NodeData | ((current: NodeData) => NodeData);
 interface NodeEditorProps {
   node: PatchNode | null;
   catalog: ImportCatalog;
+  /**
+   * The other nodes on the canvas, for the one question that cannot be answered from
+   * the selected node alone: whether an artifact authored here would collide with one
+   * authored somewhere else in the same graph.
+   *
+   * Optional, and the *selected* node is never taken from it — see
+   * [`authoredProblemsFor`] — so a caller that does not pass it loses the in-graph
+   * half of the collision check rather than the whole of the validation.
+   */
+  nodes?: readonly PatchNode[];
+  /**
+   * The workflow's name, which is what the bundle directory — and so the namespace
+   * everything in the bundle is invoked under — is slugged from.
+   *
+   * Needed because an authored name is only exportable *relative to it*: a 64-character
+   * directory and a 64-character artifact name make an invocation Claude Code cannot
+   * resolve, and without the name the dock would promise a path the export refuses.
+   * Optional, and omitting it is not the same as switching the check off: it falls back
+   * to the directory an unnamed workflow compiles into, which is the one the export
+   * would use for it.
+   */
+  workflowName?: string;
   onChange: (id: string, label: string, data: NodeDataEdit) => void;
 }
 
@@ -60,7 +92,13 @@ const TYPE_LABEL: Record<NodeType, string> = {
   conditional: "Conditional",
 };
 
-export function NodeEditor({ node, catalog, onChange }: NodeEditorProps) {
+export function NodeEditor({
+  node,
+  catalog,
+  nodes = [],
+  workflowName = "",
+  onChange,
+}: NodeEditorProps) {
   if (!node) {
     return (
       <div className="pw-dock pw-dock--empty">
@@ -113,21 +151,319 @@ export function NodeEditor({ node, catalog, onChange }: NodeEditorProps) {
         />
       )}
       {artifactKindOf(type) && (
-        <ArtifactPicker
+        <ArtifactFields
           kind={artifactKindOf(type) as ArtifactKind}
+          node={node}
+          label={label}
+          data={data as ArtifactNodeData}
+          nodes={nodes}
+          catalog={catalog}
+          workflowName={workflowName}
+          onChange={(edit) => emit(label, (current) => edit(current as ArtifactNodeData))}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * A `skill`/`agent` node's artifact, whichever way it came to be: picked out of the
+ * import catalog, or **written here**.
+ *
+ * The choice comes first because it decides what the rest of this section even is —
+ * a binding to something on disk, or a small editor for a file that does not exist
+ * yet. Everything below it is one or the other, never both.
+ */
+function ArtifactFields({
+  kind,
+  node,
+  label,
+  data,
+  nodes,
+  catalog,
+  workflowName,
+  onChange,
+}: {
+  kind: ArtifactKind;
+  node: PatchNode;
+  label: string;
+  data: ArtifactNodeData;
+  nodes: readonly PatchNode[];
+  catalog: ImportCatalog;
+  workflowName: string;
+  onChange: (edit: (current: ArtifactNodeData) => ArtifactNodeData) => void;
+}) {
+  const source = artifactSourceOf(data);
+  const noun = kind === "skill" ? "skill" : "agent";
+
+  return (
+    <>
+      <label className="pw-field">
+        <span>Artifact</span>
+        <select
+          value={source}
+          onChange={(e) => {
+            const picked = e.target.value as ArtifactSource;
+            onChange((current) =>
+              picked === "authored"
+                ? asAuthored(current, kind, label)
+                : asImported(current),
+            );
+          }}
+        >
+          {/* Each option states its consequence, like the export-mode select: the
+              choice is about whether this capability has to exist somewhere already. */}
+          <option value="imported">Import one — pick something installed</option>
+          <option value="authored">Author one here — written into the bundle</option>
+        </select>
+      </label>
+      {source === "authored" ? (
+        <AuthoredFields
+          kind={kind}
+          node={node}
+          data={data as AuthoredArtifactData}
+          nodes={nodes}
+          catalog={catalog}
+          workflowName={workflowName}
+          onChange={(edit) =>
+            onChange((current) => edit(current as AuthoredArtifactData))
+          }
+        />
+      ) : (
+        <ArtifactPicker
+          kind={kind}
           data={data as ArtifactRefData}
           catalog={catalog}
           onChange={(d) =>
-            emit(
-              label,
-              typeof d === "function"
-                ? (current) => d(current as ArtifactRefData)
-                : d,
+            onChange((current) =>
+              typeof d === "function" ? d(current as ArtifactRefData) : d,
             )
           }
         />
       )}
-    </div>
+      {source === "authored" && (
+        <p className="pw-ref">
+          This {noun} is written in this workflow, so it is always written into the
+          exported bundle — there is nothing installed for it to refer to.
+        </p>
+      )}
+    </>
+  );
+}
+
+/**
+ * Turn a node's data into an authored artifact, keeping what can be kept.
+ *
+ * The prose is kept, because losing a written body to a mis-click on a select is a
+ * real loss and the fields it would be carried in are the same ones. The **name** is
+ * not: the two shapes both have one and they mean different things, so inheriting it
+ * would author an artifact claiming the name of an installed one.
+ *
+ * The scaffold seeds only an empty body (AC3): it is a starting point, not a reset.
+ *
+ * Every carried field is read through [`asText`], not `?? ""`. An *imported* node's
+ * authoring fields are deliberately left untyped by `assertNodeShape` — that is what
+ * lets the return trip survive — so a hand-edited document with a number where prose
+ * belongs opens cleanly and lands here, and this is the first surface that reads it as
+ * prose. Not text is a field with nothing in it, the same answer the rest of the app
+ * gives (issue #27); carrying the number on instead would also make the document this
+ * produced unopenable the next time it was saved.
+ */
+function asAuthored(
+  current: ArtifactNodeData,
+  kind: ArtifactKind,
+  label: string,
+): AuthoredArtifactData {
+  const prior = current as Partial<AuthoredArtifactData>;
+  const body = asText(prior.body);
+  return {
+    ...prior,
+    source: "authored",
+    name: "",
+    description: asText(prior.description),
+    tools: carriedText(prior.tools),
+    model: carriedText(prior.model),
+    effort: carriedText(prior.effort),
+    body: body.trim() === "" ? artifactScaffold(kind, label) : body,
+  };
+}
+
+/**
+ * An optional Advanced field carried across the source switch — as the text it is meant
+ * to be, and still absent if it was absent, so a node that never had one is not given
+ * an empty one to save.
+ */
+function carriedText(value: unknown): string | undefined {
+  return value === undefined ? undefined : asText(value);
+}
+
+/** Turn it back into an unbound import, keeping the authored prose for a return trip. */
+function asImported(current: ArtifactNodeData): ArtifactRefData {
+  return {
+    ...current,
+    source: "imported",
+    name: "",
+    rootId: "",
+    exportMode: exportModeOf(current as ArtifactRefData),
+  };
+}
+
+/**
+ * The problems with the artifact this node authors, as they are *being* written.
+ *
+ * The same function `validateGraph` asks (`authoredArtifactErrors`), asked with the
+ * import catalog as well — so the dock adds exactly one thing the export cannot know,
+ * a clash with an artifact already installed, and can never disagree with the export
+ * about the rest.
+ *
+ * The selected node is taken from the **props**, not from the `nodes` list: those are
+ * a render behind while a field is being typed into, and the whole point is to answer
+ * for the character just entered.
+ */
+function authoredProblemsFor(
+  node: PatchNode,
+  nodes: readonly PatchNode[],
+  catalog: ImportCatalog,
+  workflowName: string,
+): string[] {
+  const others = nodes.filter((other) => other.id !== node.id).map(toGraphNode);
+  return (
+    authoredArtifactErrors(
+      [toGraphNode(node), ...others],
+      catalog.artifacts.map(({ kind, name }) => ({ kind, name })),
+      bundleDirNameFor(workflowName),
+    ).get(node.id) ?? []
+  );
+}
+
+/**
+ * Write a new skill or agent from inside the node — **born in the graph**.
+ *
+ * Progressive disclosure, and the split is the point: in front of the author are the
+ * fields an artifact cannot be without (a description, and the prose itself; an agent
+ * also its name), while the fuller frontmatter surface — which tools it may use,
+ * which model runs it, how hard it thinks — is folded into `Advanced`, because most
+ * artifacts never set any of it and a form that asks for everything is a form nobody
+ * finishes.
+ *
+ * A **skill** is not asked for a name at all up front: it is a directory Patchwork
+ * mints, and the graph already names it — the node's label, slugged. The override
+ * sits in `Advanced` beside the rest. See [`authoredArtifactName`] and ADR-0007.
+ *
+ * Validation is live and it never refuses a keystroke: every problem is surfaced in a
+ * status region under the fields, and the fields themselves accept anything. A dock
+ * that rejected input would make a half-typed name unrepairable.
+ */
+function AuthoredFields({
+  kind,
+  node,
+  data,
+  nodes,
+  catalog,
+  workflowName,
+  onChange,
+}: {
+  kind: ArtifactKind;
+  node: PatchNode;
+  data: AuthoredArtifactData;
+  nodes: readonly PatchNode[];
+  catalog: ImportCatalog;
+  workflowName: string;
+  onChange: (edit: (current: AuthoredArtifactData) => AuthoredArtifactData) => void;
+}) {
+  const noun = kind === "skill" ? "skill" : "agent";
+  const problems = authoredProblemsFor(node, nodes, catalog, workflowName);
+  const name = authoredArtifactName(toGraphNode(node));
+  // Asked, never re-derived. The dock may only promise a path the export has already
+  // agreed to write, and `authoredArtifactPathOf` is the *same* decision the refusal
+  // above is made from — so a name that is unusable, that its own path would not name
+  // back (`agents/SKILL.md`), or that overruns this workflow's namespace gets the
+  // problem and no path, rather than a path and a surprise on the export click.
+  const path = authoredArtifactPathOf(toGraphNode(node), bundleDirNameFor(workflowName));
+
+  /** One field, edited as an update over the node's data as it is *now*. */
+  const field = (key: keyof AuthoredArtifactData) => ({
+    onChange: (e: { target: { value: string } }) => {
+      // Read out of the event before the updater, as everywhere else in this dock:
+      // the control is controlled, so by then the DOM value is back to the prop.
+      const value = e.target.value;
+      onChange((current) => ({ ...current, [key]: value }));
+    },
+  });
+
+  const nameField = (
+    <label className="pw-field">
+      <span>Name</span>
+      <input
+        value={data.name ?? ""}
+        {...field("name")}
+        placeholder={
+          kind === "skill" ? `From the node's label: ${name || "…"}` : "e.g. report-reviewer"
+        }
+      />
+    </label>
+  );
+
+  return (
+    <>
+      {kind === "agent" && nameField}
+      <label className="pw-field pw-field--grow">
+        <span>Description</span>
+        <textarea
+          value={data.description ?? ""}
+          {...field("description")}
+          placeholder={`When Claude Code should reach for this ${noun}`}
+        />
+      </label>
+      <label className="pw-field pw-field--grow">
+        <span>Instructions</span>
+        <textarea
+          className="pw-authored-body"
+          value={data.body ?? ""}
+          {...field("body")}
+          placeholder={`What this ${noun} does, in Markdown`}
+        />
+      </label>
+      <details className="pw-advanced">
+        <summary>Advanced</summary>
+        {kind === "skill" && nameField}
+        <label className="pw-field">
+          <span>Tools</span>
+          <input
+            value={data.tools ?? ""}
+            {...field("tools")}
+            placeholder="e.g. Read, Grep, Glob — leave empty for all"
+          />
+        </label>
+        <label className="pw-field">
+          <span>Model</span>
+          <input value={data.model ?? ""} {...field("model")} placeholder="e.g. opus" />
+        </label>
+        <label className="pw-field">
+          <span>Effort</span>
+          <input value={data.effort ?? ""} {...field("effort")} placeholder="e.g. high" />
+        </label>
+      </details>
+      <div className="pw-field pw-field--grow">
+        <span>Exported as</span>
+        {path === undefined ? (
+          <p className="pw-ref pw-ref--unresolved">
+            There is nowhere in the bundle to write this {noun} yet — see below.
+          </p>
+        ) : (
+          <p className="pw-ref">
+            <code>{path}</code>
+            <br />
+            Invoked as <code>{name}</code> inside the exported bundle's namespace.
+          </p>
+        )}
+      </div>
+      {problems.map((problem) => (
+        <p className="pw-ref pw-ref--unresolved" role="status" key={problem}>
+          {problem}
+        </p>
+      ))}
+    </>
   );
 }
 
