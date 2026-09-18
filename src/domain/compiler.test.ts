@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
 import {
+  declaredNameConflict,
   isValidArtifactName,
   MAX_NAME_SEGMENT_LENGTH,
   parseArtifact,
@@ -29,6 +30,7 @@ import {
   MAX_WORKFLOW_NAME_LENGTH,
   validateGraph,
   withOperator,
+  type AuthoredArtifactData,
   type ConditionalData,
   type ConditionalRule,
   type GraphNode,
@@ -2822,3 +2824,526 @@ describe("compile — a rule-based conditional is routed by the control scaffold
 
 
 
+
+/**
+ * A workflow whose capabilities were **written in the graph**: one authored skill,
+ * one authored agent, and one imported reference alongside them.
+ *
+ * The reference is there on purpose — an authored artifact and an imported one have
+ * to coexist in one bundle, and the two sections of the umbrella that describe them
+ * say different things.
+ */
+function authoredDocument(): PatchworkDocument {
+  return {
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    workflow: {
+      name: "Triage Report",
+      description: "Triage a bug report with capabilities written here.",
+    },
+    nodes: [
+      {
+        id: "n1",
+        type: "input",
+        label: "Report",
+        data: { parameters: [{ name: "report", description: "The raw bug report." }] },
+      },
+      {
+        id: "n2",
+        type: "skill",
+        label: "Triage",
+        data: {
+          source: "authored",
+          description: "Triage an incoming bug report into one of three buckets.",
+          body: "# Triage\n\nRead the report, then sort it.\n\n## Process\n\n1. Read the report end to end.\n2. Decide which bucket it belongs in.\n",
+        },
+      },
+      {
+        id: "n3",
+        type: "agent",
+        label: "Reviewer",
+        data: {
+          source: "authored",
+          name: "report-reviewer",
+          description: "Reviews a triaged report and says whether the bucket holds.",
+          tools: "Read, Grep",
+          model: "opus",
+          effort: "high",
+          body: "You review triaged bug reports.\n\n## Report\n\nSay whether the bucket holds, and why.\n",
+        },
+      },
+      {
+        id: "n4",
+        type: "skill",
+        label: "Conventions",
+        data: { name: "conventions", rootId: "project", exportMode: "reference" },
+      },
+      {
+        id: "n5",
+        type: "output",
+        label: "Digest",
+        data: { description: "The triage digest." },
+      },
+    ],
+    edges: [
+      { id: "e1", source: "n1", target: "n2" },
+      { id: "e2", source: "n2", target: "n3" },
+      { id: "e3", source: "n3", target: "n4" },
+      { id: "e4", source: "n4", target: "n5" },
+    ],
+  };
+}
+
+describe("compile — an authored artifact is materialized into the bundle", () => {
+  it("given_theAuthoredGraph_whenCompiling_thenItIsExportableWithoutAnyArtifactsResolved", () => {
+    // The whole point of authoring in the graph: nothing has to be installed, and no
+    // source root has to be configured, for the bundle to be complete.
+    expect(validateGraph(authoredDocument())).toEqual({ ok: true });
+  });
+
+  it("given_theAuthoredGraph_whenCompiling_thenEachAuthoredArtifactLandsAtItsCanonicalLocation", () => {
+    const tree = compile(authoredDocument());
+
+    expect(tree.dirName).toBe("patchwork-triage-report");
+    expect(tree.files.map((f) => f.path)).toEqual([
+      "skills/triage/SKILL.md",
+      "agents/report-reviewer.md",
+      ".claude-plugin/plugin.json",
+      "SKILL.md",
+    ]);
+  });
+
+  it.each([
+    ["SKILL.md"],
+    [".claude-plugin/plugin.json"],
+    ["skills/triage/SKILL.md"],
+    ["agents/report-reviewer.md"],
+  ])("given_theAuthoredGraph_whenCompiling_then_%s_matchesItsGoldenFile", (path) => {
+    const tree = compile(authoredDocument());
+    const file = tree.files.find((f) => f.path === path);
+
+    expect(file?.contents).toBe(readFixture(`authored/${path}`));
+  });
+
+  it.each([
+    ["skill", "skills/triage/SKILL.md", "triage"],
+    ["agent", "agents/report-reviewer.md", "report-reviewer"],
+  ] as const)(
+    "given_anAuthored_%s_whenCompiling_thenTheEmittedFileIsOneTheCodecReadsBackAsThatArtifact",
+    (kind, path, name) => {
+      // Format compliance, asserted rather than eyeballed: the file in the bundle has
+      // to parse as the artifact it claims to be, at the location it was written to.
+      const file = compile(authoredDocument()).files.find((f) => f.path === path);
+      const parsed = parseArtifact(kind, file?.contents ?? "", name);
+
+      expect(parseArtifactLocation(path)).toEqual({ kind, name });
+      expect(parsed.name).toBe(name);
+      expect(parsed.description).not.toBe("");
+      expect(parsed.fields.name).toBe(name);
+    },
+  );
+
+  it("given_anAuthoredSkillWithNoNameOfItsOwn_whenCompiling_thenItIsNamedAfterItsNode", () => {
+    // A skill is a directory Patchwork mints, so the graph names it: the node's label,
+    // slugged. See ADR-0007.
+    const doc = authoredDocument();
+    doc.nodes[1].label = "Bug Triage";
+
+    const tree = compile(doc);
+
+    expect(tree.files.map((f) => f.path)).toContain("skills/bug-triage/SKILL.md");
+  });
+
+  it("given_anAuthoredAgentsAdvancedFields_whenCompiling_thenTheyAreEmittedAsFrontmatter", () => {
+    const file = compile(authoredDocument()).files.find(
+      (f) => f.path === "agents/report-reviewer.md",
+    );
+
+    expect(parseFrontmatter(file?.contents ?? "")).toEqual({
+      name: "report-reviewer",
+      description: "Reviews a triaged report and says whether the bucket holds.",
+      tools: "Read, Grep",
+      model: "opus",
+      effort: "high",
+    });
+  });
+
+  it("given_anAuthoredStep_whenCompiling_thenItIsInvokedByItsBundledNameAndSaysWhereItIs", () => {
+    const steps = stepsSectionOf(umbrellaOf(compile(authoredDocument())));
+
+    expect(steps[0]).toBe(
+      "1. Invoke the `patchwork-triage-report:triage` skill with the Skill tool — it is bundled here at `skills/triage/SKILL.md`, so read that file if the name does not resolve — then use its result in the next step.",
+    );
+    expect(steps[1]).toBe(
+      "2. Delegate to the `patchwork-triage-report:report-reviewer` subagent with the Task tool — it is bundled here at `agents/report-reviewer.md`, so read that file if the name does not resolve — then use its result in the next step.",
+    );
+  });
+
+  it("given_anAuthoredArtifact_whenCompiling_thenTheUmbrellaSaysItWasWrittenHereRatherThanCopiedFromSomewhere", () => {
+    // "copied from `x`" would name a source that does not exist. Where the artifact
+    // came from is the one thing that differs between the two kinds of bundled
+    // capability, and it is what tells the reader whether there is an original.
+    const skill = umbrellaOf(compile(authoredDocument()));
+
+    expect(skill).toContain(
+      "- skill `patchwork-triage-report:triage` — bundled at `skills/triage/SKILL.md`, authored in this workflow",
+    );
+    expect(skill).toContain(
+      "- subagent `patchwork-triage-report:report-reviewer` — bundled at `agents/report-reviewer.md`, authored in this workflow",
+    );
+    expect(skill).not.toContain("copied from");
+  });
+
+  it("given_anAuthoredArtifactBesideAnImportedReference_whenCompiling_thenBothSectionsAreEmitted", () => {
+    // They are different obligations for the reader: one ships in the bundle, the
+    // other has to be installed already.
+    const skill = umbrellaOf(compile(authoredDocument()));
+
+    expect(skill).toContain("## Requirements");
+    expect(skill).toContain("- skill `conventions`");
+    expect(skill).toContain("## Bundled capabilities");
+  });
+
+  it("given_aBundleThatOnlyAuthors_whenCompiling_thenItStillCarriesThePluginMarkerThatMakesItsNamespaceReal", () => {
+    // An authored artifact is invoked as `patchwork-<slug>:<leaf>` exactly as a
+    // vendored one is, so it needs the same marker or every step names nothing.
+    const marker = compile(authoredDocument()).files.find(
+      (f) => f.path === ".claude-plugin/plugin.json",
+    );
+
+    expect(JSON.parse(marker?.contents ?? "")).toEqual({
+      name: "patchwork-triage-report",
+      description: "Triage a bug report with capabilities written here.",
+    });
+  });
+
+  it("given_anAuthoredArtifactAndAVendoredOneSharingALeaf_whenCompiling_thenNeitherOverwritesTheOther", () => {
+    const doc = authoredDocument();
+    doc.nodes[3].data = { name: "coding:triage", rootId: "personal", exportMode: "vendor" };
+    const artifacts = [fixtureArtifact("skill", "skills/tdd/SKILL.md", "coding:triage")];
+
+    const tree = compile(doc, artifacts);
+
+    expect(tree.files.map((f) => f.path)).toEqual([
+      "skills/triage/SKILL.md",
+      "agents/report-reviewer.md",
+      "skills/coding-triage/SKILL.md",
+      ".claude-plugin/plugin.json",
+      "SKILL.md",
+    ]);
+  });
+
+  it("given_twoAuthoredNodesThatWouldWriteOneFile_whenCompiling_thenOnlyOneFileIsEmittedAndBothStepsNameIt", () => {
+    // `validateGraph` refuses this document — the user has to say which one wins —
+    // but `compile` is total and must never emit two files at one path.
+    const doc = authoredDocument();
+    doc.nodes[3] = {
+      id: "n4",
+      type: "skill",
+      label: "Triage again",
+      data: {
+        source: "authored",
+        name: "triage",
+        description: "A second triage skill.",
+        body: "Body.\n",
+      },
+    };
+
+    const tree = compile(doc);
+
+    expect(tree.files.filter((f) => f.path === "skills/triage/SKILL.md")).toHaveLength(1);
+    expect(umbrellaOf(tree).match(/patchwork-triage-report:triage/g)?.length).toBe(3);
+  });
+
+  it.each([
+    ["a name that is not usable at all", "not a name"],
+    ["a name that would not be discoverable back", "SKILL"],
+  ])(
+    "given_anAuthoredAgentWith_%s_whenCompiling_thenItDegradesToAReferenceAndSaysWhy",
+    (_case, name) => {
+      const doc = authoredDocument();
+      (doc.nodes[2].data as { name: string }).name = name;
+
+      const tree = compile(doc);
+
+      expect(tree.files.map((f) => f.path)).not.toContain(`agents/${name}.md`);
+      expect(vendorErrors(doc, [])).toEqual([
+        expect.stringMatching(/Agent node 'n3' authors/),
+      ]);
+    },
+  );
+
+  it.each([
+    ["at the front", (run: string) => `${run}intro\nend`],
+    ["in the middle", (run: string) => `intro\n${run}\nend`],
+    ["at the end", (run: string) => `intro\nend${run}`],
+  ])(
+    "given_anAuthoredBodyWithALongWhitespaceRun_%s_whenCompiling_thenItFinishesPromptly",
+    (_case, shape) => {
+      // A run of 100,000 whitespace characters is a paste, not an attack — and it used
+      // to cost 16 seconds on the renderer's main thread, because an unanchored
+      // `/\s+$/` matches a run *anywhere* and backtracks the whole way once `$` fails.
+      // `validateGraph` stayed at a millisecond (it uses `.trim()`), so nothing warned
+      // first: the UI simply stopped during the export. The bound is generous on
+      // purpose — the failure mode is seconds to minutes, not milliseconds.
+      const doc = authoredDocument();
+      (doc.nodes[1].data as { body: string }).body = shape("\t".repeat(100_000));
+
+      const started = performance.now();
+      const tree = compile(doc);
+      const elapsed = performance.now() - started;
+
+      expect(tree.files.map((f) => f.path)).toContain("skills/triage/SKILL.md");
+      expect(elapsed).toBeLessThan(1000);
+    },
+  );
+
+  it("given_anAuthoredNodeWhoseDataIsGone_whenCompiling_thenItStillProducesABundle", () => {
+    // The standing rule for every reader of node data: report, never throw (#27).
+    const doc = authoredDocument();
+    (doc.nodes[1] as { data: unknown }).data = undefined;
+
+    expect(() => compile(doc)).not.toThrow();
+    expect(validateGraph(doc).ok).toBe(false);
+  });
+
+  it("given_anAuthoredArtifactAtTheWorkflowNameLimit_whenCompiling_thenTheJoinedInvocationNameIsStillResolvable", () => {
+    // Two segments that are each acceptable can overrun the whole-name bound
+    // together, and then the file sits in the bundle under a name nothing resolves.
+    const doc = authoredDocument();
+    doc.workflow.name = "a".repeat(MAX_WORKFLOW_NAME_LENGTH);
+    (doc.nodes[2].data as { name: string }).name = "b".repeat(MAX_NAME_SEGMENT_LENGTH);
+
+    const problems = vendorErrors(doc, []);
+
+    expect(problems).toEqual([expect.stringContaining("which is not a name Claude Code can resolve")]);
+  });
+});
+
+/**
+ * An authored artifact and a vendored import that want the **same** bare name inside
+ * the bundle: the one case where "who is this file called what by" has two claimants.
+ */
+function nameContestDocument(authoredFirst = false): PatchworkDocument {
+  const imported: GraphNode = {
+    id: "i1",
+    type: "skill",
+    label: "Imported TDD",
+    data: { name: "coding:tdd", rootId: "personal", exportMode: "vendor" },
+  };
+  const authored: GraphNode = {
+    id: "a1",
+    type: "skill",
+    label: "Authored TDD",
+    data: {
+      source: "authored",
+      name: "tdd",
+      description: "Drive the change test-first, the way this team does.",
+      body: "# TDD\n\nWrite the failing test first.\n",
+    },
+  };
+  const middle = authoredFirst ? [authored, imported] : [imported, authored];
+  return {
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    workflow: { name: "Name Contest", description: "Two claimants for one bare name." },
+    nodes: [
+      {
+        id: "n1",
+        type: "input",
+        label: "Task",
+        data: { parameters: [{ name: "task", description: "What to build." }] },
+      },
+      ...middle,
+      { id: "n4", type: "output", label: "Result", data: { description: "The result." } },
+    ],
+    edges: [
+      { id: "e1", source: "n1", target: middle[0].id },
+      { id: "e2", source: middle[0].id, target: middle[1].id },
+      { id: "e3", source: middle[1].id, target: "n4" },
+    ],
+  };
+}
+
+describe("compile — an authored artifact's own name is what it is written under", () => {
+  it.each([
+    ["the import comes first", false],
+    ["the authored artifact comes first", true],
+  ])(
+    "given_anAuthoredNameAVendoredCopyAlsoWants_and_%s_whenCompiling_thenTheAuthoredNameIsTheOneHonoured",
+    (_case, authoredFirst) => {
+      // The author typed this name; the copy's bare name is one the bundle *chose* for
+      // it (ADR-0002). Deciding by chain order made the author's own name depend on
+      // where an unrelated node sat in the chain, silently.
+      const paths = compile(
+        nameContestDocument(authoredFirst),
+        availableArtifacts(),
+      ).files.map((f) => f.path);
+
+      expect(paths).toContain("skills/tdd/SKILL.md");
+      expect(paths).toContain("skills/coding-tdd/SKILL.md");
+    },
+  );
+
+  it("given_anAuthoredNameAVendoredCopyAlsoWants_whenCompiling_thenTheAuthoredBytesAreTheOnesAtThatPath", () => {
+    const file = compile(nameContestDocument(), availableArtifacts()).files.find(
+      (f) => f.path === "skills/tdd/SKILL.md",
+    );
+
+    expect(file?.contents).toContain("Write the failing test first.");
+  });
+
+  it.each([
+    [
+      "the canonical authored graph",
+      () => compile(authoredDocument()),
+      ["skills/triage/SKILL.md", "agents/report-reviewer.md"],
+    ],
+    [
+      "one contested with a vendored copy",
+      () => compile(nameContestDocument(), availableArtifacts()),
+      ["skills/tdd/SKILL.md"],
+    ],
+  ])(
+    "given_%s_whenCompiling_thenEveryAuthoredArtifactDeclaresTheNameItsLocationGivesIt",
+    (_case, build, authoredPaths) => {
+      // Patchwork writes both halves of an authored artifact — the path and the `name:`
+      // inside the file — so a disagreement between them is a file this repo's own
+      // Import Scanner would flag as a declared-name conflict. (A *vendored* copy is
+      // exempt and stays so: those are the user's untouched bytes, and a copy is
+      // renamed by the bundle by design. See ADR-0002.)
+      const files = build().files;
+
+      for (const path of authoredPaths) {
+        const located = parseArtifactLocation(path);
+        const contents = files.find((f) => f.path === path)?.contents ?? "";
+        const parsed = parseArtifact(located?.kind ?? "skill", contents, located?.name ?? "");
+
+        expect(parsed.fields.name).toBe(located?.name);
+        expect(declaredNameConflict(parsed)).toBeUndefined();
+      }
+    },
+  );
+
+  it.each([
+    ["a namespace segment of its own", "coding:tdd", "skills/tdd/SKILL.md"],
+    ["a Windows device name", "NUL", "skills/NUL/SKILL.md"],
+  ])(
+    "given_anAuthoredNameWith_%s_whenCompiling_thenTheExportRefusesItRatherThanWritingItAnyway",
+    (_case, name, wouldBePath) => {
+      // `validateGraph` already refuses both. The compiler must agree: the two once
+      // disagreed, and the path the bundle would have carried was derived from a leaf
+      // the validator never approved.
+      const doc = authoredDocument();
+      (doc.nodes[1].data as AuthoredArtifactData).name = name;
+
+      expect(validateGraph(doc).ok).toBe(false);
+      expect(vendorErrors(doc, [])).not.toEqual([]);
+      expect(compile(doc).files.map((f) => f.path)).not.toContain(wouldBePath);
+    },
+  );
+
+  it("given_anAuthoredNameThatPushesAVendoredCopyPastTheNameLimit_whenCompiling_thenTheRefusalNamesTheAuthoredNodeThatTookIt", () => {
+    // The authored claim is honoured first by design, so the copy falls to
+    // `<name>-2` — which is 66 characters, two over the segment bound. The refusal used
+    // to send the user to "re-pick the artifact or switch the node to reference-by-name"
+    // for an artifact whose own name is perfectly fine; the node that actually took the
+    // name is the authored one, and only it can give it back.
+    const contested = "c".repeat(MAX_NAME_SEGMENT_LENGTH);
+    const artifact: Artifact = {
+      kind: "skill",
+      name: contested,
+      description: "Installed.",
+      fields: {},
+      body: "\nBody.\n",
+      frontmatter: { open: "---\n", text: "description: Installed.", close: "\n---\n" },
+    };
+    const doc = nameContestDocument();
+    (doc.nodes[1].data as { name: string }).name = contested;
+    (doc.nodes[2].data as AuthoredArtifactData).name = contested;
+
+    const errors = vendorErrors(doc, [artifact]);
+
+    expect(errors).toEqual([
+      expect.stringContaining("Skill node 'a1' authors"),
+    ]);
+    expect(errors[0]).toContain(contested);
+    expect(compile(doc, [artifact]).files.map((f) => f.path)).toContain(
+      `skills/${contested}/SKILL.md`,
+    );
+  });
+
+  it("given_aWorkflowDescriptionAYaml11ReaderWouldNotReadAsText_whenCompiling_thenTheUmbrellaQuotesIt", () => {
+    // The umbrella is read by the same loaders the artifacts beside it are, so it goes
+    // through the codec's emitter rather than a laxer spelling of it.
+    const doc = authoredDocument();
+    doc.workflow.description = "yes";
+
+    const umbrella = compile(doc).files.find((f) => f.path === "SKILL.md");
+
+    expect(umbrella?.contents).toContain('description: "yes"');
+  });
+
+  it("given_aWorkflowDescriptionContainingATab_whenCompiling_thenTheUmbrellaCarriesNoRawTab", () => {
+    // The other end of the same emitter: a tab pasted into the workflow description
+    // reaches the *root* SKILL.md, and raw in a plain scalar it makes PyYAML refuse the
+    // whole block — the bundle's own entry point, unreadable. See `YAML_RAW_UNSAFE`.
+    const doc = authoredDocument();
+    doc.workflow.description = "Plan\tand ship.";
+
+    const umbrella = compile(doc).files.find((f) => f.path === "SKILL.md");
+
+    const frontmatter = (umbrella?.contents ?? "").split("---\n")[1] ?? "";
+    expect(frontmatter).not.toContain("\t");
+    expect(parseFrontmatter(umbrella?.contents ?? "").description).toBe("Plan\tand ship.");
+  });
+
+  it.each([
+    ["a description that is not text", "description", 42],
+    ["a body that is not text", "body", ["a"]],
+    ["a tools field that is not text", "tools", 7],
+    ["a model field that is not text", "model", {}],
+  ])(
+    "given_inMemoryAuthoredDataWith_%s_whenCompiling_thenItReportsRatherThanThrows",
+    (_case, field, value) => {
+      // `validateGraph` said "exportable" and then `compile` threw: the worst ordering
+      // there is. Both are total over in-memory node data (issue #27).
+      const doc = authoredDocument();
+      (doc.nodes[1].data as unknown as Record<string, unknown>)[field] = value;
+
+      expect(() => validateGraph(doc)).not.toThrow();
+      expect(() => compile(doc)).not.toThrow();
+      expect(() => vendorErrors(doc, [])).not.toThrow();
+    },
+  );
+
+  it("given_anArtifactNodeWhoseDataIsNull_whenCompiling_thenItReportsRatherThanThrows", () => {
+    const doc = authoredDocument();
+    (doc.nodes[1] as { data: unknown }).data = null;
+
+    expect(() => compile(doc)).not.toThrow();
+  });
+});
+
+describe("compile — the fixtures of every earlier slice are byte-identical", () => {
+  it.each([
+    ["linear", () => compile(canonicalLinearDocument())],
+    ["imported", () => compile(importedRefDocument())],
+    ["conditional", () => compile(conditionalDocument())],
+    ["rule-conditional", () => compile(ruleConditionalDocument())],
+    ["fan-in", () => compile(fanInDocument())],
+    ["vendor-mix", () => compile(vendorMixDocument(), availableArtifacts())],
+  ])(
+    "given_aDocumentThatAuthorsNothing_whenCompiling_then_%s_isUnchangedByThisSlice",
+    (fixture, build) => {
+      // Slice 8 emits new material only where a document authors something. Every file
+      // of every earlier golden bundle has to come back out byte-for-byte, or an
+      // existing workflow re-exports differently than it did yesterday.
+      const tree = build();
+
+      for (const file of tree.files) {
+        expect(`${file.path}: ${file.contents}`).toBe(
+          `${file.path}: ${readFixture(`${fixture}/${file.path}`)}`,
+        );
+      }
+    },
+  );
+});

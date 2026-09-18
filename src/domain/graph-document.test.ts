@@ -16,10 +16,16 @@ import {
   MAX_BUNDLE_DIR_LENGTH,
   MAX_WORKFLOW_NAME_LENGTH,
   type ArtifactRefData,
+  type AuthoredArtifactData,
   type ConditionalData,
   type ConditionalRule,
+  type GraphNode,
   type InputData,
   type PatchworkDocument,
+  artifactSourceOf,
+  authoredArtifactErrors,
+  authoredArtifactName,
+  authoredArtifactOf,
   conditionalModeOf,
   deserialize,
   exportModeOf,
@@ -795,6 +801,18 @@ describe("export mode — the per-node vendor-copy vs reference-by-name choice",
     expect(
       exportModeOf({ name: "tdd", rootId: "r", exportMode: "vendor" }),
     ).toBe("vendor");
+  });
+
+  it("given_refDataWithAModeThatIsNotOne_whenAskedForIt_thenTheDefaultIsReturned", () => {
+    // `deserialize` refuses this on an imported node, but an *authored* one carries an
+    // `exportMode` nothing type-checks, and the dock writes it back into the imported
+    // shape on the way out — so a value that is not a mode has to read as the default
+    // here rather than being handed on to a select, a path, or the next `deserialize`.
+    for (const mode of [42, null, "", "   ", "Vendor", { v: 1 }]) {
+      expect(
+        exportModeOf({ name: "tdd", rootId: "r", exportMode: mode as never }),
+      ).toBe("reference");
+    }
   });
 });
 
@@ -2307,5 +2325,580 @@ describe("deserialize — forward migration to v5", () => {
     const conditional = migrated.nodes.find((n) => n.type === "conditional");
 
     expect(conditionalModeOf(conditional?.data as ConditionalData)).toBe("llm");
+  });
+});
+
+/**
+ * A graph whose `Skill`/`Agent` nodes were **authored here** rather than imported:
+ * the shape slice 8 added, and the reference point for every test below.
+ */
+function authoredDocument(): PatchworkDocument {
+  return {
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    workflow: {
+      name: "Triage Report",
+      description: "Triage a bug report with capabilities written here.",
+    },
+    nodes: [
+      {
+        id: "n1",
+        type: "input",
+        label: "Report",
+        data: { parameters: [{ name: "report", description: "The raw report." }] },
+      },
+      {
+        id: "n2",
+        type: "skill",
+        label: "Triage",
+        data: {
+          source: "authored",
+          description: "Triage an incoming bug report.",
+          body: "# Triage\n\nRead the report.\n",
+        },
+      },
+      {
+        id: "n3",
+        type: "agent",
+        label: "Reviewer",
+        data: {
+          source: "authored",
+          name: "report-reviewer",
+          description: "Reviews a triaged report.",
+          body: "You review triaged reports.\n",
+        },
+      },
+      {
+        id: "n4",
+        type: "output",
+        label: "Digest",
+        data: { description: "The triage digest." },
+      },
+    ],
+    edges: [
+      { id: "e1", source: "n1", target: "n2" },
+      { id: "e2", source: "n2", target: "n3" },
+      { id: "e3", source: "n3", target: "n4" },
+    ],
+  };
+}
+
+/** The authored data of one node of the canonical authored document. */
+function authoredDataOf(doc: PatchworkDocument, id: string): AuthoredArtifactData {
+  return doc.nodes.find((n) => n.id === id)?.data as AuthoredArtifactData;
+}
+
+describe("authored artifacts — a node's artifact can be born in the graph", () => {
+  it("given_anArtifactNodeWithoutASource_whenAsked_thenItIsAnImportedReferenceAsItAlwaysWas", () => {
+    // Every document written before slice 8 has artifact nodes with no `source`, and
+    // they must keep meaning exactly what they meant. Read through the function, never
+    // by testing for the field.
+    expect(artifactSourceOf({ name: "tdd", rootId: "personal" })).toBe("imported");
+    expect(artifactSourceOf({ source: "imported", name: "tdd", rootId: "personal" })).toBe(
+      "imported",
+    );
+  });
+
+  it("given_anAuthoredArtifactNode_whenAsked_thenItsAuthoredDataIsReturned", () => {
+    const doc = authoredDocument();
+    const node = doc.nodes.find((n) => n.id === "n2") as GraphNode;
+
+    expect(artifactSourceOf(node.data as AuthoredArtifactData)).toBe("authored");
+    expect(authoredArtifactOf(node)?.description).toBe("Triage an incoming bug report.");
+  });
+
+  it.each([
+    ["an imported reference", { name: "tdd", rootId: "personal" }],
+    ["data that is not there at all", undefined],
+    ["data of the wrong shape entirely", 42],
+  ])("given_%s_whenAsked_thenThereIsNoAuthoredArtifactAndNothingThrows", (_case, data) => {
+    // Asked of every `skill`/`agent` node the canvas and the compiler see, including
+    // ones from a hand-edited document `deserialize` never saw (issue #27).
+    const node = { id: "n2", type: "skill", label: "Skill", data } as unknown as GraphNode;
+
+    expect(authoredArtifactOf(node)).toBeUndefined();
+  });
+
+  it("given_anAuthoredAgent_whenNamed_thenItIsCalledWhatTheAuthorTyped", () => {
+    const doc = authoredDocument();
+
+    expect(authoredArtifactName(doc.nodes.find((n) => n.id === "n3") as GraphNode)).toBe(
+      "report-reviewer",
+    );
+  });
+
+  it("given_anAuthoredSkillWithNoNameOfItsOwn_whenNamed_thenTheNodesLabelNamesIt", () => {
+    // A skill is a *directory Patchwork mints*, so the graph already names it: the
+    // node's own label, slugged the way the workflow name is. That is what lets the
+    // minimal skill form ask for a description and nothing else. See ADR-0007.
+    const doc = authoredDocument();
+
+    expect(authoredArtifactName(doc.nodes.find((n) => n.id === "n2") as GraphNode)).toBe(
+      "triage",
+    );
+  });
+
+  it.each([
+    ["an empty one", ""],
+    ["nothing but spaces", "   "],
+    ["punctuation only", "!!!"],
+    ["emoji only", "\u{1F389}\u{1F389}"],
+    ["a Chinese one", "\u4e2d\u6587"],
+    ["a Greek one", "\u03b1\u03b2\u03b3"],
+  ])(
+    "given_anAuthoredSkillWhoseLabelIs_%s_whenNamed_thenItHasNoNameRatherThanBeingCalledWorkflow",
+    (_case, label) => {
+      // The slug's *fallback* is the workflow directory's, and borrowing it here named
+      // every non-Latin-script author's skill `workflow` — one of them silently
+      // misnamed, two of them a collision on a name nobody typed.
+      const doc = authoredDocument();
+      doc.nodes[1].label = label;
+
+      expect(authoredArtifactName(doc.nodes[1])).toBe("");
+    },
+  );
+
+  it("given_anAuthoredSkillWhoseLabelIsNotAStringAtAll_whenNamed_thenItHasNoNameRatherThanThrowing", () => {
+    // `authoredArtifactPathOf` and `authoredArtifactErrors` run on every dock render, so
+    // a throw here is an unrecoverable dock crash rather than an error list — precisely
+    // what issue #27 forbids. Not reachable from a file (`assertNodeShape` refuses a
+    // non-string label), reachable from in-memory node data a hand edit made nonsense of.
+    const doc = authoredDocument();
+    (doc.nodes[1] as { label: unknown }).label = 42;
+
+    expect(authoredArtifactName(doc.nodes[1])).toBe("");
+  });
+
+  it("given_anAuthoredSkillWhoseLabelSlugsToNothing_whenValidating_thenItIsRefusedAndPointedAtTheNameField", () => {
+    const doc = authoredDocument();
+    doc.nodes[1].label = "\u4e2d\u6587";
+
+    const result = validateGraph(doc);
+    expect(result.ok).toBe(false);
+    expect((result as { errors: string[] }).errors).toEqual([
+      expect.stringMatching(/Skill node 'n2'.*label.*name/s),
+    ]);
+  });
+
+  it("given_anAuthoredSkillWithAnUnusableLabelButAnExplicitName_whenValidating_thenItExportsFine", () => {
+    // The way out, and the reason refusing the label is acceptable: a skill carries an
+    // explicit name too, so the minimal form stays usable whatever script the author
+    // writes their labels in.
+    const doc = authoredDocument();
+    doc.nodes[1].label = "\u4e2d\u6587";
+    authoredDataOf(doc, "n2").name = "triage";
+
+    expect(validateGraph(doc)).toEqual({ ok: true });
+  });
+
+  it("given_twoAuthoredSkillsWithUnsluggableLabels_whenValidating_thenNeitherIsAccusedOfCollidingOnWorkflow", () => {
+    const doc = authoredDocument();
+    doc.nodes[1].label = "\u4e2d\u6587";
+    doc.nodes[2] = {
+      ...doc.nodes[2],
+      type: "skill",
+      label: "\u65e5\u672c\u8a9e",
+      data: { source: "authored", description: "A second one.", body: "Body.\n" },
+    };
+
+    const errors = (validateGraph(doc) as { errors: string[] }).errors;
+    expect(errors.join("\n")).not.toContain("workflow");
+  });
+
+  it("given_twoLabelsThatDifferOnlyInUnicodeNormalization_whenNamed_thenTheySlugToOneName", () => {
+    // `caf\u00e9` composed and decomposed are the same word to a reader, so they must not
+    // become two artifacts with no collision reported between them.
+    const composed = { ...authoredDocument().nodes[1], label: "caf\u00e9 skill" };
+    const decomposed = { ...composed, label: "cafe\u0301 skill" };
+
+    expect(authoredArtifactName(decomposed)).toBe(authoredArtifactName(composed));
+  });
+
+  it("given_anAuthoredSkillThatWasGivenAName_whenNamed_thenTheNameWinsOverTheLabel", () => {
+    const doc = authoredDocument();
+    (doc.nodes[1].data as AuthoredArtifactData).name = "bug-triage";
+
+    expect(authoredArtifactName(doc.nodes[1])).toBe("bug-triage");
+  });
+
+  it("given_theCanonicalAuthoredGraph_whenValidating_thenItIsExportableWithNoSourceRootAnywhere", () => {
+    // The point of the slice: an authored artifact has no disk location and needs no
+    // configured root, so the `rootId` rule an imported reference lives under cannot
+    // apply to it.
+    expect(validateGraph(authoredDocument())).toEqual({ ok: true });
+  });
+});
+
+describe("validateGraph — an authored artifact's required fields", () => {
+  it.each([
+    ["a skill", "n2"],
+    ["an agent", "n3"],
+  ])("given_%s_withNoDescription_whenValidating_thenItIsRefusedInTheWordsOfItsNode", (
+    _case,
+    id,
+  ) => {
+    const doc = authoredDocument();
+    authoredDataOf(doc, id).description = "   ";
+
+    const result = validateGraph(doc);
+    expect(result.ok).toBe(false);
+    expect((result as { errors: string[] }).errors).toEqual([
+      expect.stringMatching(new RegExp(`node '${id}'.*description`)),
+    ]);
+  });
+
+  it("given_anAuthoredAgentWithNoName_whenValidating_thenItIsRefusedBecauseTheFileHasNoName", () => {
+    // An agent is a single file `agents/<name>.md`, and nothing else in the graph says
+    // what that file is called.
+    const doc = authoredDocument();
+    authoredDataOf(doc, "n3").name = "  ";
+
+    const result = validateGraph(doc);
+    expect(result.ok).toBe(false);
+    expect((result as { errors: string[] }).errors).toEqual([
+      expect.stringMatching(/Agent node 'n3'.*name/),
+    ]);
+  });
+
+  it.each([
+    ["a backtick", "re`viewer"],
+    ["a path separator", "reviewer/2"],
+    ["two namespace segments", "a:b:c"],
+    ["an over-long segment", "a".repeat(65)],
+  ])(
+    "given_anAuthoredNameContaining_%s_whenValidating_thenItIsRefusedBeforeItBecomesAPath",
+    (_case, name) => {
+      const doc = authoredDocument();
+      authoredDataOf(doc, "n3").name = name;
+
+      const result = validateGraph(doc);
+      expect(result.ok).toBe(false);
+      expect((result as { errors: string[] }).errors).toEqual([
+        expect.stringContaining("is not a usable artifact name"),
+      ]);
+    },
+  );
+
+  it.each([
+    ["one namespace segment", "coding:triage"],
+    ["a leading colon", ":triage"],
+  ])(
+    "given_anAuthoredNameWith_%s_whenValidating_thenItIsRefusedBecauseTheBundleIsTheNamespace",
+    (_case, name) => {
+      // An authored artifact lands *bare* inside the bundle, whose directory is the
+      // namespace. A name that carries one of its own would be written to a path whose
+      // leaf disagrees with the `name:` the file declares.
+      const doc = authoredDocument();
+      authoredDataOf(doc, "n3").name = name;
+
+      const result = validateGraph(doc);
+      expect(result.ok).toBe(false);
+      expect((result as { errors: string[] }).errors).toEqual([
+        expect.stringContaining("is not a usable artifact name"),
+      ]);
+    },
+  );
+
+  it.each([["CON"], ["PRN"], ["AUX"], ["NUL"], ["COM1"], ["LPT1"], ["nul"], ["NUL.log"]])(
+    "given_anAuthoredNameOf_%s_whenValidating_thenItIsRefusedAsAWindowsDeviceName",
+    (name) => {
+      // The first path where the *user invents* the string rather than it coming off a
+      // real file — and these cannot be created on NTFS at all, so the export would
+      // fail on the far side of a bundle the app called valid.
+      const doc = authoredDocument();
+      authoredDataOf(doc, "n3").name = name;
+
+      const result = validateGraph(doc);
+      expect(result.ok).toBe(false);
+      expect((result as { errors: string[] }).errors).toEqual([
+        expect.stringContaining("is not a usable artifact name"),
+      ]);
+    },
+  );
+
+  it.each([
+    ["description", 42],
+    ["description", { text: "x" }],
+    ["body", ["a"]],
+    ["body", 1],
+  ])(
+    "given_inMemoryAuthoredData_whose_%s_isNotAString_whenValidating_thenItReportsRatherThanThrows",
+    (field, value) => {
+      // Node data that never went through `deserialize` — a hand edit, a canvas state
+      // mid-flight. `validateGraph` is total (issue #27), and a field that is not text
+      // is a field with nothing in it.
+      const doc = authoredDocument();
+      (authoredDataOf(doc, "n2") as unknown as Record<string, unknown>)[field] = value;
+
+      expect(() => validateGraph(doc)).not.toThrow();
+      expect(validateGraph(doc).ok).toBe(false);
+    },
+  );
+
+  it.each([
+    ["name", 7],
+    ["name", { first: "x" }],
+    ["tools", 3],
+    ["model", []],
+    ["effort", 1],
+  ])(
+    "given_inMemoryAuthoredData_whose_optional_%s_isNotAString_whenValidating_thenNothingThrows",
+    (field, value) => {
+      const doc = authoredDocument();
+      (authoredDataOf(doc, "n2") as unknown as Record<string, unknown>)[field] = value;
+
+      expect(() => validateGraph(doc)).not.toThrow();
+    },
+  );
+
+  it("given_anAuthoredArtifactWithAnEmptyBody_whenValidating_thenItIsRefused", () => {
+    // Frontmatter alone is a declaration with nothing behind it: the body is the whole
+    // of what Claude Code does when it invokes the artifact.
+    const doc = authoredDocument();
+    authoredDataOf(doc, "n2").body = "\n  \n";
+
+    const result = validateGraph(doc);
+    expect(result.ok).toBe(false);
+    expect((result as { errors: string[] }).errors).toEqual([
+      expect.stringMatching(/Skill node 'n2'.*empty/),
+    ]);
+  });
+
+  it("given_anAuthoredNode_whenValidating_thenItIsNeverAskedForTheSourceRootAnImportedOneNeeds", () => {
+    const doc = authoredDocument();
+
+    const result = validateGraph(doc);
+    expect(JSON.stringify(result)).not.toContain("source root");
+  });
+
+  it.each([
+    ["data that is not there", undefined],
+    ["data of the wrong shape", "authored"],
+  ])(
+    "given_anArtifactNodeWith_%s_whenValidating_thenItReportsRatherThanThrows",
+    (_case, data) => {
+      const doc = authoredDocument();
+      (doc.nodes[1] as { data: unknown }).data = data;
+
+      expect(() => validateGraph(doc)).not.toThrow();
+      expect(validateGraph(doc).ok).toBe(false);
+    },
+  );
+});
+
+describe("authoredArtifactErrors — a name that would collide when it is written", () => {
+  it("given_twoAuthoredNodesClaimingOneName_whenValidating_thenBothAreNamedRatherThanOneSilentlyWinning", () => {
+    // They would land on one path inside the bundle, so only one file can exist. The
+    // user has to say which, which means both nodes have to be named.
+    const doc = authoredDocument();
+    doc.nodes[2] = {
+      ...doc.nodes[2],
+      type: "skill",
+      data: {
+        source: "authored",
+        name: "triage",
+        description: "A second triage skill.",
+        body: "Body.\n",
+      },
+    };
+
+    const result = validateGraph(doc);
+    expect(result.ok).toBe(false);
+    expect((result as { errors: string[] }).errors).toEqual([
+      expect.stringMatching(/'n2'.*'triage'/),
+      expect.stringMatching(/'n3'.*'triage'/),
+    ]);
+  });
+
+  it("given_anAuthoredSkillAndAgentSharingAName_whenValidating_thenNeitherCollidesWithTheOther", () => {
+    // Skills and agents are separate namespaces and land at different paths, exactly
+    // as they do for a vendored copy.
+    const doc = authoredDocument();
+    authoredDataOf(doc, "n3").name = "triage";
+
+    expect(validateGraph(doc)).toEqual({ ok: true });
+  });
+
+  it("given_twoNamesThatDifferOnlyInCase_whenValidating_thenTheyStillCollide", () => {
+    // The bundle is written to a filesystem, and the default one on macOS and Windows
+    // treats `skills/triage/` and `skills/Triage/` as one directory.
+    const doc = authoredDocument();
+    authoredDataOf(doc, "n3").name = "Triage";
+    doc.nodes[2] = { ...doc.nodes[2], type: "skill" };
+
+    expect(validateGraph(doc).ok).toBe(false);
+  });
+
+  it("given_anAuthoredNameAlreadyInstalledInASourceRoot_whenAskedWithTheCatalog_thenTheClashIsReported", () => {
+    // The export cannot see this — a bundle is its own namespace — but the author is
+    // about to write this artifact to a root (#23), and finding out then is too late.
+    const doc = authoredDocument();
+
+    const problems = authoredArtifactErrors(doc.nodes, [
+      { kind: "skill", name: "triage" },
+    ]);
+
+    expect(problems.get("n2")).toEqual([
+      expect.stringMatching(/already.*source root/i),
+    ]);
+    expect(problems.get("n3")).toBeUndefined();
+  });
+
+  it("given_anInstalledArtifactOfTheOtherKind_whenAskedWithTheCatalog_thenThereIsNoClash", () => {
+    const problems = authoredArtifactErrors(authoredDocument().nodes, [
+      { kind: "agent", name: "triage" },
+    ]);
+
+    expect(problems.get("n2")).toBeUndefined();
+  });
+
+  it("given_anInstalledClash_whenValidatingTheDocumentAlone_thenTheExportIsNotRefusedForIt", () => {
+    // `validateGraph` knows nothing about the user's roots, and must not: an authored
+    // artifact is materialized *into the bundle*, whose namespace is the bundle's own.
+    expect(validateGraph(authoredDocument())).toEqual({ ok: true });
+  });
+});
+
+describe("authoredArtifactErrors — a name that would be refused at export time", () => {
+  it("given_anAuthoredAgentNamedSKILL_whenValidating_thenItIsRefusedLiveRatherThanOnTheExportClick", () => {
+    // `agents/SKILL.md` is not an artifact at all under the layout rule — a `SKILL.md`
+    // in an agents directory may not claim a name — so the copy would sit in the
+    // bundle under a name nothing resolves. The compiler already refused it; the dock
+    // meanwhile printed an "Exported as `agents/SKILL.md`" line that was never true.
+    const doc = authoredDocument();
+    authoredDataOf(doc, "n3").name = "SKILL";
+
+    const result = validateGraph(doc);
+    expect(result.ok).toBe(false);
+    expect((result as { errors: string[] }).errors).toEqual([
+      expect.stringMatching(/Agent node 'n3'.*'agents\/SKILL\.md'.*not be discoverable/),
+    ]);
+  });
+
+  it("given_anAuthoredSkillNamedSKILL_whenValidating_thenItIsAcceptedBecauseItsPathStillNamesItBack", () => {
+    // The rule is the round trip, not the word: `skills/SKILL/SKILL.md` resolves back
+    // to `SKILL`, so nothing is wrong with it.
+    const doc = authoredDocument();
+    authoredDataOf(doc, "n2").name = "SKILL";
+
+    expect(validateGraph(doc)).toEqual({ ok: true });
+  });
+
+  it("given_anAuthoredNameThatOverrunsTheInvocationBoundWithTheBundleDirectory_whenValidating_thenItIsRefusedLive", () => {
+    // Two segments that are each acceptable can still overrun the whole-name bound
+    // together: a 64-character bundle directory plus a 64-character name is 129.
+    const doc = authoredDocument();
+    doc.workflow.name = "w".repeat(54);
+    authoredDataOf(doc, "n3").name = "a".repeat(64);
+
+    const result = validateGraph(doc);
+    expect(result.ok).toBe(false);
+    expect((result as { errors: string[] }).errors).toEqual([
+      expect.stringMatching(/Agent node 'n3'.*would be invoked as.*shorten/i),
+    ]);
+  });
+
+  it("given_anAuthoredNameOneCharacterInsideThatBound_whenValidating_thenItIsAccepted", () => {
+    const doc = authoredDocument();
+    doc.workflow.name = "w".repeat(54);
+    authoredDataOf(doc, "n3").name = "a".repeat(63);
+
+    expect(validateGraph(doc)).toEqual({ ok: true });
+  });
+
+  it("given_theSameNameAskedWithoutABundleDirectory_whenAskedByTheDock_thenOnlyTheDirectoryFreeChecksRun", () => {
+    // The dock is the other surface of this function, and it is handed the same bundle
+    // directory the export will use; asked without one, it may not invent a bound.
+    const doc = authoredDocument();
+    authoredDataOf(doc, "n3").name = "a".repeat(64);
+
+    expect(authoredArtifactErrors(doc.nodes).get("n3")).toBeUndefined();
+    expect(
+      authoredArtifactErrors(doc.nodes, [], `patchwork-${"w".repeat(54)}`).get("n3"),
+    ).toEqual([expect.stringMatching(/would be invoked as/)]);
+  });
+});
+
+describe("deserialize — an authored artifact is carried in the document", () => {
+  it("given_anAuthoredDocument_whenRoundTripped_thenEveryFieldSurvivesIncludingTheBody", () => {
+    // AC5: the `.patchwork` file is self-contained, so a graph with a capability
+    // nobody has installed is still shareable.
+    const doc = authoredDocument();
+    (doc.nodes[2].data as AuthoredArtifactData).tools = "Read, Grep";
+    (doc.nodes[2].data as AuthoredArtifactData).model = "opus";
+    (doc.nodes[2].data as AuthoredArtifactData).effort = "high";
+
+    expect(deserialize(serialize(doc))).toEqual(doc);
+  });
+
+  it("given_anAuthoredNodeWithAnUnknownSource_whenDeserializing_thenItIsRefusedRatherThanGuessed", () => {
+    // Guessing would decide, on the user's behalf, whether the bundle carries a file
+    // or expects to find one — the same reason an unknown `exportMode` is refused.
+    const doc = authoredDocument();
+    (doc.nodes[1].data as { source: string }).source = "borrowed";
+
+    expect(() => deserialize(serialize(doc))).toThrow(/invalid 'source'/);
+  });
+
+  it.each([
+    ["description", 7],
+    ["body", null],
+    ["name", 3],
+    ["tools", []],
+  ])(
+    "given_anAuthoredNodeWhose_%s_isNotAString_whenDeserializing_thenItIsRefusedAtTheLoadBoundary",
+    (field, value) => {
+      // Everything here is read as a string by the compiler and by the dock; a wrong
+      // type would surface as a TypeError far from the file that caused it.
+      const doc = authoredDocument();
+      (doc.nodes[1].data as Record<string, unknown>)[field] = value;
+
+      expect(() => deserialize(serialize(doc))).toThrow(new RegExp(`'${field}'`));
+    },
+  );
+
+  it("given_anAuthoredNode_whenDeserializing_thenItIsNotAskedForTheNameAndRootIdAnImportedOneNeeds", () => {
+    expect(() => deserialize(serialize(authoredDocument()))).not.toThrow();
+  });
+});
+
+describe("deserialize — forward migration to v7", () => {
+  it.each([["schema-v5.patchwork"], ["schema-v6.patchwork"]])(
+    "given_%s_whenDeserializing_thenItOpensUnchangedAtTheCurrentVersion",
+    (fixture) => {
+      // 6 -> 7 only widened the vocabulary: an artifact node may now say it was
+      // authored here. No older node says so, so an older document is already a valid
+      // v7 one. (6 itself is a pure version bump — see `MIGRATIONS`.)
+      const original = JSON.parse(readFixture(fixture)) as PatchworkDocument;
+
+      const migrated = deserialize(readFixture(fixture));
+
+      expect(migrated.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+      expect(migrated.workflow).toEqual(original.workflow);
+      expect(migrated.nodes).toEqual(original.nodes);
+      expect(migrated.edges).toEqual(original.edges);
+    },
+  );
+
+  it("given_schemaV6Fixture_whenDeserializing_thenItsArtifactNodesAreStillImportedReferences", () => {
+    const migrated = deserialize(readFixture("schema-v6.patchwork"));
+
+    for (const node of migrated.nodes.filter((n) => n.type === "skill" || n.type === "agent")) {
+      expect(artifactSourceOf(node.data as ArtifactRefData)).toBe("imported");
+      expect(authoredArtifactOf(node)).toBeUndefined();
+    }
+  });
+
+  it("given_everyOlderFixture_whenDeserializing_thenItStillOpensAtTheCurrentVersion", () => {
+    for (const version of [1, 2, 3, 4, 5, 6]) {
+      expect(
+        deserialize(readFixture(`schema-v${version}.patchwork`)).schemaVersion,
+      ).toBe(CURRENT_SCHEMA_VERSION);
+    }
+  });
+
+  it("given_theCurrentVersion_whenAsked_thenItIsTheOneThisSlicesFormatIsIdentifiedBy", () => {
+    // Pinned, not incidental: two branches once defined 6 differently, so a version
+    // number that no longer identifies a format is the failure this asserts against.
+    expect(CURRENT_SCHEMA_VERSION).toBe(7);
   });
 });
